@@ -1,3 +1,19 @@
+"""
+Streamlit dashboard for the loan-portfolio case study.
+
+The dashboard intentionally separates three concerns:
+1. Data Cleaning: run deterministic cleaning rules, inspect validation logs, and
+   resolve only those exceptions that require source-system or reviewer judgment.
+2. Portfolio Summary: summarize only rows explicitly marked ``Include in Analysis = TRUE``
+   using exposure-weighted statistics. Review status and analytical inclusion are separate.
+3. Workflow: explain the control framework and the distinction between automatic
+   corrections, flag-only checks, and human review.
+
+State is stored in ``st.session_state`` so the uploaded workbook, cleaned data, manual
+review decisions, and audit log survive navigation between the three pages during the
+current browser session.
+"""
+
 from __future__ import annotations
 
 import io
@@ -33,6 +49,7 @@ SYSTEM_COLUMNS = {
     "Exposure Outlier Flag",
     "Manual Review Required",
     "Manual Review Reason",
+    "Include in Analysis",
     "Issue Summary",
     "Reviewer Decision",
     "Reviewer Note",
@@ -65,8 +82,15 @@ RAW_BUSINESS_COLUMNS = [
 # State helpers
 # -----------------------------------------------------------------------------
 def initialize_state() -> None:
+    """Create persistent session variables once per browser session.
+
+    Streamlit reruns the script after most UI interactions.  Keeping the workbook bytes
+    and analysis objects in session state prevents page navigation from behaving like a
+    fresh upload/cleaning run.
+    """
     defaults = {
         "source_file_name": None,
+        "source_file_bytes": None,
         "source_signature": None,
         "raw_df": None,
         "cleaned_df": None,
@@ -81,6 +105,7 @@ def initialize_state() -> None:
 
 
 def reset_analysis_state() -> None:
+    """Clear derived analysis while leaving the currently uploaded file available."""
     st.session_state.raw_df = None
     st.session_state.cleaned_df = None
     st.session_state.initial_log = None
@@ -89,7 +114,9 @@ def reset_analysis_state() -> None:
 
 
 def dataframe_signature(file_bytes: bytes, sheet_name: str) -> tuple[int, int, str]:
-    # A lightweight signature is enough to detect a different upload in one session.
+    # A lightweight in-session change detector is sufficient here; this is not intended
+    # to be a cryptographic file fingerprint.  Including the sheet name also ensures
+    # that switching the source sheet starts a new analysis.
     return (len(file_bytes), hash(file_bytes[:4096]), sheet_name)
 
 
@@ -123,7 +150,13 @@ def build_download_workbook(
     initial_log: pd.DataFrame | None,
     manual_edit_log: pd.DataFrame | None,
 ) -> bytes:
-    """Build a downloadable Excel workbook entirely in memory."""
+    """
+    Build a downloadable Excel workbook entirely in memory.
+
+    The export separates the current cleaned dataset from the current validation log,
+    the unresolved manual-review subset, the original cleaning log, and the manual-edit
+    audit trail.  This preserves both the latest analytical state and how it was reached.
+    """
     output = io.BytesIO()
 
     export_df = cleaned_df.copy()
@@ -133,8 +166,19 @@ def build_download_workbook(
         cols = [c for c in export_df.columns if c != RECORD_ID_COL] + [RECORD_ID_COL]
         export_df = export_df[cols]
 
+    # Keep both unresolved review items and manually excluded records easy to audit.
+    # A reviewed-but-excluded duplicate may no longer require manual review, yet it is
+    # still analytically important to retain in the workbook.
     manual_review = export_df[
         export_df["Manual Review Required"].fillna(False).astype(bool)
+        | ~export_df["Include in Analysis"].fillna(False).astype(bool)
+    ].copy()
+
+    analysis_included = export_df[
+        export_df["Include in Analysis"].fillna(False).astype(bool)
+    ].copy()
+    analysis_excluded = export_df[
+        ~export_df["Include in Analysis"].fillna(False).astype(bool)
     ].copy()
 
     with pd.ExcelWriter(
@@ -146,6 +190,8 @@ def build_download_workbook(
         export_df.to_excel(writer, sheet_name="Cleaned_Data", index=False)
         current_log.to_excel(writer, sheet_name="Current_Validation_Log", index=False)
         manual_review.to_excel(writer, sheet_name="Manual_Review", index=False)
+        analysis_included.to_excel(writer, sheet_name="Analysis_Included", index=False)
+        analysis_excluded.to_excel(writer, sheet_name="Analysis_Excluded", index=False)
 
         if initial_log is not None and not initial_log.empty:
             initial_log.to_excel(writer, sheet_name="Initial_Cleaning_Log", index=False)
@@ -163,10 +209,27 @@ def build_download_workbook(
 # Cleaning / validation workflow
 # -----------------------------------------------------------------------------
 def run_initial_cleaning(raw_df: pd.DataFrame) -> None:
+    """Run the standalone cleaner and initialize reviewer/audit fields.
+
+    ``_Record ID`` is a dashboard-only row key.  It is intentionally independent of
+    Loan ID so two source rows can still be edited separately when the source itself
+    contains a duplicated Loan ID.
+    """
     working = raw_df.copy()
     working.insert(0, RECORD_ID_COL, np.arange(1, len(working) + 1))
 
     cleaned_df, quality_log = clean_loan_portfolio(working)
+
+    # The cleaner initializes analysis inclusion conservatively:
+    #   Manual Review Required = FALSE -> Include in Analysis = TRUE
+    #   Manual Review Required = TRUE  -> Include in Analysis = FALSE
+    # Inclusion is a separate analytical control. During manual review the user may
+    # change it directly; no Reviewer Decision automatically forces inclusion/exclusion.
+    if "Include in Analysis" not in cleaned_df.columns:
+        cleaned_df["Include in Analysis"] = ~cleaned_df[
+            "Manual Review Required"
+        ].fillna(False).astype(bool)
+
     cleaned_df["Reviewer Decision"] = "Pending"
     cleaned_df["Reviewer Note"] = ""
 
@@ -198,11 +261,28 @@ def values_equal(a, b) -> bool:
 
 
 def apply_verified_overrides(df: pd.DataFrame) -> pd.DataFrame:
-    """A reviewer may explicitly accept an unusual value after verification."""
+    """
+    Resolve row-level review status for explicit reviewer conclusions.
+
+    Two reviewer decisions are treated as resolved:
+      - Verified - keep as-is: the unusual value has been confirmed as valid.
+      - Confirmed duplicate - exclude: the row is confirmed to be a duplicate record.
+
+    IMPORTANT: this function does NOT change ``Include in Analysis``.
+    Analytical inclusion is an independent manual control. The reviewer must explicitly
+    check or uncheck Include in Analysis in the Manual Review table.
+
+    This separation allows, for example:
+      - a verified large exposure to be included;
+      - a confirmed duplicate to remain excluded;
+      - a still-open item to be temporarily included if the reviewer chooses.
+    """
     df = df.copy()
-    verified = df["Reviewer Decision"].eq("Verified - keep as-is")
-    df.loc[verified, "Manual Review Required"] = False
-    df.loc[verified, "Manual Review Reason"] = ""
+    resolved = df["Reviewer Decision"].isin(
+        ["Verified - keep as-is", "Confirmed duplicate - exclude"]
+    )
+    df.loc[resolved, "Manual Review Required"] = False
+    df.loc[resolved, "Manual Review Reason"] = ""
     return df
 
 
@@ -212,7 +292,13 @@ def apply_manual_review_edits(edited_review_df: pd.DataFrame) -> None:
 
     Why rerun instead of manually clearing flags?
     Because a corrected rating/date/duplicate key should be validated by the same
-    business rules that created the flag in the first place.
+    business rules that created the flag in the first place. ``Corrected - recheck``
+    therefore changes the underlying field and lets the rules determine whether the
+    issue is resolved. ``Verified - keep as-is`` and ``Confirmed duplicate - exclude``
+    can close the review status when appropriate.
+
+    ``Include in Analysis`` is separate from all of those statuses. Its checkbox is
+    always the authoritative instruction for Portfolio Summary.
     """
     current = st.session_state.cleaned_df.copy()
     if current is None or current.empty:
@@ -222,7 +308,7 @@ def apply_manual_review_edits(edited_review_df: pd.DataFrame) -> None:
     edited_by_id = edited_review_df.set_index(RECORD_ID_COL, drop=False)
 
     audit_rows: list[dict] = []
-    decision_map: dict[int, tuple[str, str]] = {}
+    decision_map: dict[int, tuple[str, str, bool]] = {}
 
     editable_fields = [c for c in RAW_BUSINESS_COLUMNS if c in current.columns]
 
@@ -232,7 +318,8 @@ def apply_manual_review_edits(edited_review_df: pd.DataFrame) -> None:
 
         decision = str(revised_row.get("Reviewer Decision", "Pending") or "Pending")
         note = str(revised_row.get("Reviewer Note", "") or "")
-        decision_map[int(record_id)] = (decision, note)
+        include_in_analysis = bool(revised_row.get("Include in Analysis", False))
+        decision_map[int(record_id)] = (decision, note, include_in_analysis)
 
         original_row = current_by_id.loc[record_id]
         loan_id = revised_row.get("Loan ID")
@@ -256,12 +343,36 @@ def apply_manual_review_edits(edited_review_df: pd.DataFrame) -> None:
                 )
                 current_by_id.at[record_id, col] = after
 
+        # ``Include in Analysis`` is the reviewer's explicit analytical decision.
+        # It is intentionally not derived from Reviewer Decision.
+        previous_include = bool(
+            original_row.get(
+                "Include in Analysis",
+                not bool(original_row.get("Manual Review Required", False)),
+            )
+        )
+        if include_in_analysis != previous_include:
+            audit_rows.append(
+                {
+                    "Timestamp": datetime.now().isoformat(timespec="seconds"),
+                    RECORD_ID_COL: int(record_id),
+                    "Loan ID": loan_id,
+                    "Field": "Include in Analysis",
+                    "Previous Value": previous_include,
+                    "Revised Value": include_in_analysis,
+                    "Reviewer Decision": decision,
+                    "Reviewer Note": note,
+                }
+            )
+
+        current_by_id.at[record_id, "Include in Analysis"] = include_in_analysis
         current_by_id.at[record_id, "Reviewer Decision"] = decision
         current_by_id.at[record_id, "Reviewer Note"] = note
 
     revised = current_by_id.reset_index(drop=True)
 
-    # Remove derived columns before rerunning the cleaning engine. The record ID and
+    # Remove derived/previous-validation columns before rerunning the cleaning engine
+    # so stale flags cannot survive a corrected value.  The dashboard Record ID and
     # reviewer fields are retained because the cleaner safely carries unknown columns.
     derived_cols = [
         "Implied Tenor (Yrs)",
@@ -270,6 +381,7 @@ def apply_manual_review_edits(edited_review_df: pd.DataFrame) -> None:
         "Exposure Outlier Flag",
         "Manual Review Required",
         "Manual Review Reason",
+        "Include in Analysis",
         "Issue Summary",
     ]
     revised_for_validation = revised.drop(
@@ -285,10 +397,15 @@ def apply_manual_review_edits(edited_review_df: pd.DataFrame) -> None:
     if "Reviewer Note" not in revalidated_df.columns:
         revalidated_df["Reviewer Note"] = ""
 
-    for record_id, (decision, note) in decision_map.items():
+    for record_id, (decision, note, include_in_analysis) in decision_map.items():
         mask = revalidated_df[RECORD_ID_COL].eq(record_id)
         revalidated_df.loc[mask, "Reviewer Decision"] = decision
         revalidated_df.loc[mask, "Reviewer Note"] = note
+
+        # Restore the reviewer's explicit inclusion choice after revalidation.
+        # Validation may change Manual Review Required, but it must not overwrite the
+        # user's analytical-inclusion decision.
+        revalidated_df.loc[mask, "Include in Analysis"] = bool(include_in_analysis)
 
         # Log the review decision itself, even when no business field was changed.
         previous_decision = str(
@@ -312,17 +429,20 @@ def apply_manual_review_edits(edited_review_df: pd.DataFrame) -> None:
                 }
             )
 
-    # Corrected records remain subject to the checks. Explicitly verified values may
-    # be accepted even if they remain statistical outliers (e.g., >100% LTV or an
-    # unusually large exposure).
+    # Corrected records remain subject to every validation rule. Explicit reviewer
+    # conclusions can close the review status, but they never determine analytical
+    # inclusion. Include in Analysis remains the independent checkbox selected above.
     revalidated_df = apply_verified_overrides(revalidated_df)
 
-    # Keep the validation log consistent with explicit reviewer acceptance.
+    # Keep the validation log consistent with explicit reviewer acceptance.  The
+    # standalone cleaner's audit log is keyed by Loan ID rather than the dashboard-only
+    # Record ID, so duplicate Loan IDs are inherently less granular in this log.  The
+    # Cleaned_Data/manual-review table remains row-specific because it uses Record ID.
     current_log = current_log.copy()
     current_log["Reviewer Decision"] = ""
     current_log["Reviewer Note"] = ""
-    for record_id, (decision, note) in decision_map.items():
-        if decision != "Verified - keep as-is":
+    for record_id, (decision, note, include_in_analysis) in decision_map.items():
+        if decision not in {"Verified - keep as-is", "Confirmed duplicate - exclude"}:
             continue
         loan_ids = revalidated_df.loc[
             revalidated_df[RECORD_ID_COL].eq(record_id), "Loan ID"
@@ -349,6 +469,9 @@ def apply_manual_review_edits(edited_review_df: pd.DataFrame) -> None:
 # -----------------------------------------------------------------------------
 # Summary helpers
 # -----------------------------------------------------------------------------
+# Unless otherwise stated, portfolio percentages are exposure-weighted using cleaned
+# Outstanding Balance.  This is more decision-relevant for credit concentration than
+# simple loan counts because a $1M loan and an $800M loan should not contribute equally.
 def exposure_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     total = df[BALANCE_COL].sum()
     result = (
@@ -366,6 +489,7 @@ def exposure_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
 
 
 def risk_rating_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize rating exposure while preserving invalid/unrated loans in total exposure."""
     working = df.copy()
     rating = working["Internal Risk Rating (1-10)"].astype("Int64")
     working["Risk Rating"] = rating.astype("string").fillna("Unrated / Invalid")
@@ -419,7 +543,8 @@ def concentration_snapshot(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def assumptions_table(df: pd.DataFrame, include_open_reviews: bool) -> pd.DataFrame:
+def assumptions_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Document analytical assumptions so dashboard results are reproducible and reviewable."""
     actual_rows = len(df)
     return pd.DataFrame(
         [
@@ -442,8 +567,9 @@ def assumptions_table(df: pd.DataFrame, include_open_reviews: bool) -> pd.DataFr
                 "Assumption / Rule": "Negative outstanding balance",
                 "Treatment": (
                     "The automated cleaner treats a negative loan balance as a sign-entry "
-                    "error and uses the absolute value for analysis, while keeping the item "
-                    "open for manual/source-system verification."
+                    "error and stores the absolute value as a case-study assumption. Because "
+                    "the record still requires manual verification, it is excluded from "
+                    "Portfolio Summary by default until the reviewer changes Include in Analysis."
                 ),
             },
             {
@@ -463,15 +589,19 @@ def assumptions_table(df: pd.DataFrame, include_open_reviews: bool) -> pd.DataFr
             {
                 "Assumption / Rule": "Duplicates",
                 "Treatment": (
-                    "Duplicate Loan IDs and possible duplicate facilities are retained unless "
-                    "the reviewer corrects them; they are flagged rather than automatically removed."
+                    "Duplicate Loan IDs and possible duplicate facilities are preserved in "
+                    "Cleaned_Data for auditability and flagged for review. They are excluded "
+                    "from analysis by default; the reviewer manually decides whether each row "
+                    "should be included after verification."
                 ),
             },
             {
                 "Assumption / Rule": "Large exposure / high LTV",
                 "Treatment": (
-                    "Statistically unusual exposures and LTV above 100% are retained because "
-                    "they can be real. They require verification rather than automatic correction."
+                    "Statistically unusual exposures and LTV above 100% are retained in the "
+                    "cleaned dataset because they can be economically valid. They are review "
+                    "items and therefore start excluded from analysis; the reviewer may include "
+                    "them once comfortable with the value."
                 ),
             },
             {
@@ -482,11 +612,12 @@ def assumptions_table(df: pd.DataFrame, include_open_reviews: bool) -> pd.DataFr
                 ),
             },
             {
-                "Assumption / Rule": "Open manual-review records",
+                "Assumption / Rule": "Analysis inclusion",
                 "Treatment": (
-                    "Open manual-review records are included in the displayed summary."
-                    if include_open_reviews
-                    else "Open manual-review records are excluded from the displayed summary."
+                    "Portfolio Summary uses only rows with Include in Analysis = TRUE. "
+                    "The automated default excludes rows requiring manual review and includes "
+                    "all other rows. During review, Include in Analysis is controlled manually "
+                    "and is independent of Reviewer Decision."
                 ),
             },
         ]
@@ -530,30 +661,87 @@ def render_cleaning_page() -> None:
         "resolve uncertain records, and download the revised clean workbook."
     )
 
-    uploaded = st.file_uploader("Upload case-study Excel file", type=["xlsx", "xlsm"])
-    if uploaded is None:
+    if st.session_state.cleaned_df is not None:
+        open_reviews = int(
+            st.session_state.cleaned_df["Manual Review Required"]
+            .fillna(False)
+            .astype(bool)
+            .sum()
+        )
+        st.info(
+            f"Session analysis is active"
+            + (
+                f" for **{st.session_state.source_file_name}**"
+                if st.session_state.source_file_name
+                else ""
+            )
+            + f". Open manual-review rows: **{open_reviews}**. "
+              "You can move between pages without re-uploading or rerunning the cleaning."
+        )
+
+    uploaded = st.file_uploader(
+        "Upload case-study Excel file",
+        type=["xlsx", "xlsm"],
+        key="source_workbook_uploader",
+        help=(
+            "Once a workbook has been loaded, it remains available during this browser "
+            "session when you move between Data Cleaning, Portfolio Summary, and Workflow."
+        ),
+    )
+
+    # Persist the workbook independently of the file_uploader widget.  Streamlit may
+    # recreate widget state after the user navigates to another sidebar page; session
+    # state survives those reruns, so storing the bytes here prevents the manual-review
+    # page from appearing empty when the user returns from Portfolio Summary/Workflow.
+    if uploaded is not None:
+        incoming_bytes = uploaded.getvalue()
+        incoming_name = uploaded.name
+
+        # Save the source file immediately. The sheet-level signature below determines
+        # whether the analysis must be reset.
+        st.session_state.source_file_bytes = incoming_bytes
+        st.session_state.source_file_name = incoming_name
+
+    file_bytes = st.session_state.source_file_bytes
+
+    if file_bytes is None:
         st.info("Upload the raw workbook to begin.")
         return
 
-    file_bytes = uploaded.getvalue()
+    if uploaded is None and st.session_state.source_file_name:
+        st.success(
+            f"Using workbook already loaded in this session: "
+            f"**{st.session_state.source_file_name}**"
+        )
+
     excel_file = pd.ExcelFile(io.BytesIO(file_bytes))
-    default_index = (
-        excel_file.sheet_names.index(DATA_SHEET)
-        if DATA_SHEET in excel_file.sheet_names
-        else 0
-    )
+
+    # Prefer the previously selected sheet when returning to this page.
+    if (
+        st.session_state.selected_sheet is not None
+        and st.session_state.selected_sheet in excel_file.sheet_names
+    ):
+        default_sheet = st.session_state.selected_sheet
+    elif DATA_SHEET in excel_file.sheet_names:
+        default_sheet = DATA_SHEET
+    else:
+        default_sheet = excel_file.sheet_names[0]
+
+    default_index = excel_file.sheet_names.index(default_sheet)
 
     selected_sheet = st.selectbox(
         "Data sheet",
         options=excel_file.sheet_names,
         index=default_index,
+        key="source_sheet_selector",
     )
 
     signature = dataframe_signature(file_bytes, selected_sheet)
     if st.session_state.source_signature != signature:
+        # A genuinely new workbook or a different source sheet should start
+        # a new analysis. Merely leaving and returning to the page should not.
         reset_analysis_state()
         st.session_state.source_signature = signature
-        st.session_state.source_file_name = uploaded.name
         st.session_state.selected_sheet = selected_sheet
 
     run_col, note_col = st.columns([1, 3])
@@ -586,11 +774,13 @@ def render_cleaning_page() -> None:
     current_log = st.session_state.current_log
 
     unresolved = cleaned_df["Manual Review Required"].fillna(False).astype(bool)
-    k1, k2, k3, k4 = st.columns(4)
+    included = cleaned_df["Include in Analysis"].fillna(False).astype(bool)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Input records", f"{len(st.session_state.raw_df):,}")
     k2.metric("Cleaned records", f"{len(cleaned_df):,}")
     k3.metric("Current validation issues", f"{len(current_log):,}")
     k4.metric("Rows requiring manual review", f"{int(unresolved.sum()):,}")
+    k5.metric("Rows included in analysis", f"{int(included.sum()):,}")
 
     download_bytes = build_download_workbook(
         cleaned_df,
@@ -641,17 +831,24 @@ def render_cleaning_page() -> None:
                 )
 
     with tab_review:
+        # Keep unresolved records in the queue, but also keep records that are currently
+        # excluded from analysis even after review. This prevents an excluded duplicate
+        # or a verified-but-not-yet-included row from disappearing before the reviewer
+        # has a chance to change the inclusion checkbox.
         review_df = cleaned_df[
             cleaned_df["Manual Review Required"].fillna(False).astype(bool)
+            | ~cleaned_df["Include in Analysis"].fillna(False).astype(bool)
         ].copy()
 
         if review_df.empty:
-            st.success("No unresolved row-level manual review flags remain.")
+            st.success("No manual-review or analysis-exclusion items remain.")
         else:
             st.markdown(
-                "Edit the underlying business field(s) where you know the correct value. "
-                "For a value that is unusual but verified as correct, choose **Verified - keep as-is**. "
-                "Then apply revisions to rerun the validation rules."
+                "Review or correct the underlying business field(s). "
+                "**Include in Analysis** is an independent manual checkbox: leave it unchecked "
+                "while the record should be excluded, or check it when you decide the record "
+                "should contribute to Portfolio Summary. Reviewer Decision does not automatically "
+                "change analytical inclusion."
             )
 
             display_cols = [
@@ -676,6 +873,7 @@ def render_cleaning_page() -> None:
                 "LTV (%)",
                 "Relationship Manager",
                 "Manual Review Reason",
+                "Include in Analysis",
                 "Reviewer Decision",
                 "Reviewer Note",
             ]
@@ -690,12 +888,21 @@ def render_cleaning_page() -> None:
                 num_rows="fixed",
                 disabled=[RECORD_ID_COL, "Manual Review Reason"],
                 column_config={
+                    "Include in Analysis": st.column_config.CheckboxColumn(
+                        "Include in Analysis",
+                        help=(
+                            "Authoritative switch for Portfolio Summary. "
+                            "Checked = included; unchecked = excluded."
+                        ),
+                    ),
                     "Reviewer Decision": st.column_config.SelectboxColumn(
                         "Reviewer Decision",
                         options=[
                             "Pending",
+                            "Pending verification - exclude",
                             "Corrected - recheck",
                             "Verified - keep as-is",
+                            "Confirmed duplicate - exclude",
                         ],
                         required=True,
                     ),
@@ -737,6 +944,8 @@ def render_summary_page() -> None:
     st.caption(
         "Case-study summary: portfolio composition, rate mix, risk profile, notable concentrations, and assumptions."
     )
+    # The summary reads the latest session-state dataset, so manual corrections become
+    # visible here after the reviewer clicks "Apply revisions and rerun checks".
 
     if st.session_state.cleaned_df is None:
         st.info("Go to **Data Cleaning & Manual Review**, upload the workbook, and run cleaning first.")
@@ -744,20 +953,30 @@ def render_summary_page() -> None:
 
     full_df = st.session_state.cleaned_df.copy()
 
-    open_review = full_df["Manual Review Required"].fillna(False).astype(bool)
-    include_open_reviews = st.toggle(
-        "Include open manual-review records in summary",
-        value=True,
-        help=(
-            "The base case keeps unresolved records unless the data is unusable. "
-            "Turn this off for a sensitivity view excluding open review rows."
-        ),
-    )
+    # Portfolio Summary has one authoritative population rule:
+    # only rows explicitly marked Include in Analysis = TRUE are summarized.
+    # Manual Review Required is intentionally NOT used as the summary filter because
+    # review status and analytical inclusion are separate controls.
+    include_mask = full_df["Include in Analysis"].fillna(False).astype(bool)
+    df = full_df.loc[include_mask].copy()
 
-    df = full_df if include_open_reviews else full_df.loc[~open_review].copy()
+    excluded_df = full_df.loc[~include_mask].copy()
+    open_review = full_df["Manual Review Required"].fillna(False).astype(bool)
+
     if df.empty:
-        st.warning("No records remain under the selected summary filter.")
+        st.warning(
+            "No records are currently marked Include in Analysis = TRUE. "
+            "Return to Data Cleaning / Manual Review and select records for analysis."
+        )
         return
+
+    included_exposure = df[BALANCE_COL].sum()
+    excluded_exposure = excluded_df[BALANCE_COL].sum()
+    st.caption(
+        f"Summary population: {len(df):,} included row(s); "
+        f"{len(excluded_df):,} excluded row(s). "
+        f"Excluded exposure: {format_currency(excluded_exposure)}."
+    )
 
     total_exposure = df[BALANCE_COL].sum()
     floating_exposure = df.loc[
@@ -868,7 +1087,7 @@ def render_summary_page() -> None:
 
     st.subheader("Assumptions & Data Treatment")
     st.dataframe(
-        assumptions_table(full_df, include_open_reviews),
+        assumptions_table(full_df),
         hide_index=True,
         use_container_width=True,
     )
@@ -877,9 +1096,13 @@ def render_summary_page() -> None:
         full_df["Manual Review Required"].fillna(False).astype(bool)
     ]
     if not unresolved_df.empty:
+        unresolved_included = unresolved_df[
+            unresolved_df["Include in Analysis"].fillna(False).astype(bool)
+        ]
         st.info(
-            f"{len(unresolved_df)} row(s) currently remain under manual review. "
-            "Use Page 1 to revise or explicitly verify them."
+            f"{len(unresolved_df)} row(s) currently remain under manual review; "
+            f"{len(unresolved_included)} of them are manually included in this summary. "
+            "Use Page 1 to change inclusion or complete review."
         )
 
 
@@ -982,7 +1205,7 @@ def render_workflow_page() -> None:
         ];
 
         outlier [
-            label="9. Exposure outlier check\n3×IQR review flag\nNo automatic deletion",
+            label="9. Exposure outlier check\n3×IQR = Q3 + 3×(Q3−Q1)\nReview flag; no automatic deletion",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
@@ -994,32 +1217,51 @@ def render_workflow_page() -> None:
         ];
 
         decision [
-            label="Any unresolved issue?",
+            label="Manual Review Required?",
             shape=diamond,
             fillcolor="#F3E8FF",
             color="#8B5FBF"
         ];
 
+        auto_include [
+            label="NO\nInclude in Analysis = TRUE\nautomatically",
+            fillcolor="#EAF6EC",
+            color="#4E9A5F"
+        ];
+
         manual [
-            label="Manual Review Required = TRUE\nReviewer edits value OR verifies keep-as-is",
+            label="YES\nDefault Include in Analysis = FALSE\nReviewer edits / verifies record",
             fillcolor="#FDECEC",
             color="#C75B5B"
         ];
 
         recheck [
-            label="Rerun all validation rules\nUpdate flags & audit trail",
+            label="Rerun validation rules\nUpdate review flags & audit trail\nPreserve manual inclusion choice",
             fillcolor="#FDECEC",
             color="#C75B5B"
         ];
 
+        include_decision [
+            label="Include in Analysis?",
+            shape=diamond,
+            fillcolor="#F3E8FF",
+            color="#8B5FBF"
+        ];
+
         final [
-            label="Final Cleaned Dataset\nManual Review Required = FALSE",
+            label="TRUE\nIncluded in Portfolio Summary",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
+        excluded [
+            label="FALSE\nRetained in Cleaned_Data\nExcluded from Portfolio Summary",
+            fillcolor="#FDECEC",
+            color="#C75B5B"
+        ];
+
         outputs [
-            label="Outputs\nCleaned_Data\nValidation Log\nManual Review\nDownload Excel",
+            label="Outputs\nCleaned_Data\nAnalysis Included / Excluded\nValidation Log\nDownload Excel",
             fillcolor="#E8F1FB",
             color="#4C78A8"
         ];
@@ -1037,12 +1279,18 @@ def render_workflow_page() -> None:
         outlier -> fuzzy;
         fuzzy -> decision;
 
+        decision -> auto_include [label=" No "];
+        auto_include -> final;
+
         decision -> manual [label=" Yes "];
         manual -> recheck;
-        recheck -> decision [label=" Revalidate "];
+        recheck -> include_decision;
 
-        decision -> final [label=" No "];
+        include_decision -> final [label=" Yes "];
+        include_decision -> excluded [label=" No "];
+
         final -> outputs;
+        excluded -> outputs;
     }
     """
 
@@ -1068,13 +1316,19 @@ def render_workflow_page() -> None:
             },
             {
                 "Stage": "Manual review",
-                "Examples": "Corrected value or verified unusual value",
-                "Treatment": "Reviewer records decision/note; all validation rules are rerun.",
+                "Examples": "Corrected value, verified unusual value, confirmed duplicate",
+                "Treatment": (
+                    "Reviewer records decision/note and manually selects Include in Analysis. "
+                    "Validation is rerun, but inclusion is not inferred from review status."
+                ),
             },
             {
                 "Stage": "Final output",
-                "Examples": "Cleaned dataset, current validation log, manual-review sheet",
-                "Treatment": "Downloadable Excel preserves both clean data and audit trail.",
+                "Examples": "Cleaned dataset, included/excluded analysis sets, validation log",
+                "Treatment": (
+                    "Portfolio Summary uses only Include in Analysis = TRUE; downloadable Excel "
+                    "preserves included, excluded, review, and audit records."
+                ),
             },
         ]
     )
@@ -1090,13 +1344,11 @@ def render_workflow_page() -> None:
     if st.session_state.cleaned_df is not None:
         df = st.session_state.cleaned_df
         open_review = df["Manual Review Required"].fillna(False).astype(bool)
+        analysis_included = df["Include in Analysis"].fillna(False).astype(bool)
         c1, c2, c3 = st.columns(3)
         c1.metric("Current records", f"{len(df):,}")
         c2.metric("Open manual review", f"{int(open_review.sum()):,}")
-        c3.metric(
-            "Resolved / usable rows",
-            f"{int((~open_review).sum()):,}",
-        )
+        c3.metric("Included in analysis", f"{int(analysis_included.sum()):,}")
         st.caption(
             "These metrics reflect the workbook currently loaded in the Data Cleaning page."
         )
@@ -1119,6 +1371,26 @@ def main() -> None:
     )
 
     st.sidebar.markdown("---")
+    if st.session_state.cleaned_df is not None:
+        sidebar_open = int(
+            st.session_state.cleaned_df["Manual Review Required"]
+            .fillna(False)
+            .astype(bool)
+            .sum()
+        )
+        sidebar_included = int(
+            st.session_state.cleaned_df["Include in Analysis"]
+            .fillna(False)
+            .astype(bool)
+            .sum()
+        )
+        st.sidebar.success(
+            f"Workbook loaded\n\n"
+            f"{st.session_state.source_file_name or 'Current session'}\n\n"
+            f"Open review rows: {sidebar_open}\n\n"
+            f"Included in analysis: {sidebar_included}"
+        )
+
     st.sidebar.caption(
         "Deterministic issues are corrected automatically. "
         "Ambiguous issues are flagged for review rather than guessed."
