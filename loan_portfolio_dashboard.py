@@ -1,17 +1,20 @@
 """
 Streamlit dashboard for the loan-portfolio case study.
 
-The dashboard intentionally separates three concerns:
+The dashboard intentionally separates four concerns:
 1. Data Cleaning: run deterministic cleaning rules, inspect validation logs, and
    resolve only those exceptions that require source-system or reviewer judgment.
 2. Portfolio Summary: summarize only rows explicitly marked ``Include in Analysis = TRUE``
    using exposure-weighted statistics. Review status and analytical inclusion are separate.
-3. Workflow: explain the control framework and the distinction between automatic
+3. Statistical Analysis: use exploratory logistic regression to identify characteristics
+   associated with weaker loan performance and K-means clustering to identify natural
+   portfolio risk segments.
+4. Workflow: explain the control framework and the distinction between automatic
    corrections, flag-only checks, and human review.
 
 State is stored in ``st.session_state`` so the uploaded workbook, cleaned data, manual
-review decisions, and audit log survive navigation between the three pages during the
-current browser session.
+review decisions, and audit log survive navigation between pages during the current
+browser session.
 """
 
 from __future__ import annotations
@@ -24,6 +27,18 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import statsmodels.api as sm
+
+from sklearn.cluster import KMeans
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import silhouette_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from clean_loan_portfolio_FINAL import clean_loan_portfolio
 
@@ -655,6 +670,728 @@ def exposure_bar(summary: pd.DataFrame, category_col: str, title: str):
     return fig
 
 
+
+# -----------------------------------------------------------------------------
+# Performance-analysis helpers
+# -----------------------------------------------------------------------------
+PERFORMANCE_STATUS_ORDER = ["Performing", "Watchlist", "Non-Performing"]
+HIGHER_RISK_STATUSES = {"Watchlist", "Non-Performing"}
+
+
+def normalized_status_order(df: pd.DataFrame) -> list[str]:
+    """
+    Return a stable Loan Status order for charts.
+
+    The three case-study statuses are shown first. Any unexpected or missing status is
+    preserved at the end rather than silently dropped, so the chart remains an audit
+    of the actual analytical population.
+    """
+    observed = (
+        df["Loan Status"]
+        .fillna("Missing")
+        .astype(str)
+        .drop_duplicates()
+        .tolist()
+    )
+    extras = [s for s in observed if s not in PERFORMANCE_STATUS_ORDER]
+    return PERFORMANCE_STATUS_ORDER + sorted(extras)
+
+
+def performance_mix_by_dimension(
+    df: pd.DataFrame,
+    dimension: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build exposure-weighted Loan Status mix for a categorical dimension.
+
+    Returns:
+      - long_mix: one row per dimension/status combination for a 100% stacked chart.
+      - summary: one row per category with total exposure, loan count, and higher-risk
+        exposure share (Watchlist + Non-Performing).
+
+    Exposure weighting is used because a $100M problem loan is economically more
+    important than a $1M problem loan even though both count as one record.
+    """
+    working = df.copy()
+    working[dimension] = working[dimension].fillna("Missing").astype(str)
+    working["Loan Status"] = working["Loan Status"].fillna("Missing").astype(str)
+
+    grouped = (
+        working.groupby([dimension, "Loan Status"], dropna=False)
+        .agg(
+            Exposure=(BALANCE_COL, "sum"),
+            Loan_Count=("Loan ID", "size"),
+        )
+        .reset_index()
+    )
+
+    totals = (
+        working.groupby(dimension, dropna=False)
+        .agg(
+            Total_Exposure=(BALANCE_COL, "sum"),
+            Total_Loans=("Loan ID", "size"),
+        )
+        .reset_index()
+    )
+
+    long_mix = grouped.merge(totals, on=dimension, how="left")
+    long_mix["Exposure Share"] = np.where(
+        long_mix["Total_Exposure"] != 0,
+        long_mix["Exposure"] / long_mix["Total_Exposure"],
+        np.nan,
+    )
+
+    high_risk = (
+        grouped[grouped["Loan Status"].isin(HIGHER_RISK_STATUSES)]
+        .groupby(dimension, dropna=False)["Exposure"]
+        .sum()
+        .rename("Higher_Risk_Exposure")
+        .reset_index()
+    )
+
+    summary = totals.merge(high_risk, on=dimension, how="left")
+    summary["Higher_Risk_Exposure"] = summary["Higher_Risk_Exposure"].fillna(0.0)
+    summary["Higher-Risk Exposure %"] = np.where(
+        summary["Total_Exposure"] != 0,
+        summary["Higher_Risk_Exposure"] / summary["Total_Exposure"],
+        np.nan,
+    )
+
+    # Add each observed status as a separate exposure/share column for a compact table.
+    exposure_pivot = grouped.pivot_table(
+        index=dimension,
+        columns="Loan Status",
+        values="Exposure",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    for status in exposure_pivot.columns:
+        summary = summary.merge(
+            exposure_pivot[[status]]
+            .rename(columns={status: f"{status} Exposure"})
+            .reset_index(),
+            on=dimension,
+            how="left",
+        )
+        summary[f"{status} %"] = np.where(
+            summary["Total_Exposure"] != 0,
+            summary[f"{status} Exposure"] / summary["Total_Exposure"],
+            np.nan,
+        )
+
+    summary = summary.sort_values("Total_Exposure", ascending=False).reset_index(drop=True)
+    return long_mix, summary
+
+
+def performance_stack_chart(
+    df: pd.DataFrame,
+    dimension: str,
+    title: str,
+    top_n: int | None = None,
+):
+    """
+    Create a 100% stacked exposure chart by Loan Status.
+
+    Categories are ordered by total exposure so the largest portfolio segments appear
+    first. For high-cardinality dimensions such as Relationship Manager, ``top_n`` can
+    keep the display readable without changing the underlying summary table.
+    """
+    long_mix, summary = performance_mix_by_dimension(df, dimension)
+
+    if top_n is not None and len(summary) > top_n:
+        keep = summary.head(top_n)[dimension].tolist()
+        long_mix = long_mix[long_mix[dimension].isin(keep)].copy()
+        summary = summary[summary[dimension].isin(keep)].copy()
+
+    category_order = summary.sort_values("Total_Exposure", ascending=True)[dimension].tolist()
+
+    fig = px.bar(
+        long_mix,
+        x="Exposure Share",
+        y=dimension,
+        color="Loan Status",
+        orientation="h",
+        barmode="stack",
+        title=title,
+        category_orders={"Loan Status": normalized_status_order(df)},
+        hover_data={
+            "Exposure": ":,.0f",
+            "Loan_Count": True,
+            "Total_Exposure": ":,.0f",
+            "Exposure Share": ":.1%",
+        },
+    )
+    fig.update_xaxes(tickformat=".0%", range=[0, 1], title="Share of category exposure")
+    fig.update_yaxes(
+        title=None,
+        categoryorder="array",
+        categoryarray=category_order,
+    )
+    fig.update_layout(
+        height=max(380, 34 * max(len(category_order), 1) + 120),
+        legend_title_text="Loan Status",
+    )
+    return fig, summary
+
+
+def display_performance_summary_table(
+    summary: pd.DataFrame,
+    dimension: str,
+) -> None:
+    """Format the most decision-useful columns for display."""
+    display = summary.copy()
+    display["Total Exposure"] = display["Total_Exposure"].map(format_currency)
+    display["Higher-Risk Exposure"] = display["Higher_Risk_Exposure"].map(format_currency)
+    display["Higher-Risk Exposure %"] = display["Higher-Risk Exposure %"].map(
+        lambda x: f"{x:.1%}" if pd.notna(x) else "—"
+    )
+
+    columns = [
+        dimension,
+        "Total_Loans",
+        "Total Exposure",
+        "Higher-Risk Exposure",
+        "Higher-Risk Exposure %",
+    ]
+
+    for status in normalized_status_order(
+        pd.DataFrame({"Loan Status": [
+            c.replace(" Exposure", "")
+            for c in summary.columns
+            if c.endswith(" Exposure") and c != "Higher_Risk_Exposure"
+        ]})
+    ):
+        pct_col = f"{status} %"
+        if pct_col in display.columns:
+            display[pct_col] = display[pct_col].map(
+                lambda x: f"{x:.1%}" if pd.notna(x) else "—"
+            )
+            columns.append(pct_col)
+
+    st.dataframe(
+        display[[c for c in columns if c in display.columns]],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def exposure_weighted_mean(
+    frame: pd.DataFrame,
+    value_col: str,
+    weight_col: str = BALANCE_COL,
+) -> float:
+    """Return a weighted mean using only rows with valid value and positive weight."""
+    valid = frame[[value_col, weight_col]].copy()
+    valid[value_col] = pd.to_numeric(valid[value_col], errors="coerce")
+    valid[weight_col] = pd.to_numeric(valid[weight_col], errors="coerce")
+    valid = valid[
+        valid[value_col].notna()
+        & valid[weight_col].notna()
+        & (valid[weight_col] > 0)
+    ]
+    if valid.empty or valid[weight_col].sum() == 0:
+        return np.nan
+    return float(np.average(valid[value_col], weights=valid[weight_col]))
+
+
+def status_numeric_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarize LTV, tenor, and risk rating by Loan Status.
+
+    Both ordinary medians and exposure-weighted means are shown. Weighted means describe
+    where portfolio dollars sit, while medians reduce the influence of one very large loan.
+    """
+    working = df.copy()
+    working["Loan Status"] = working["Loan Status"].fillna("Missing").astype(str)
+
+    # Prefer implied tenor when the dates are valid; otherwise fall back to stated tenor.
+    # This maximizes usable observations while preserving the cleaner's date validation.
+    implied = pd.to_numeric(working.get("Implied Tenor (Yrs)"), errors="coerce")
+    stated = pd.to_numeric(working.get("Stated Tenor (Yrs)"), errors="coerce")
+    working["Analytical Tenor (Yrs)"] = implied.combine_first(stated)
+
+    rows = []
+    for status, group in working.groupby("Loan Status", dropna=False):
+        ltv = pd.to_numeric(group["LTV (%)"], errors="coerce")
+        tenor = pd.to_numeric(group["Analytical Tenor (Yrs)"], errors="coerce")
+        rating = pd.to_numeric(group["Internal Risk Rating (1-10)"], errors="coerce")
+
+        rows.append(
+            {
+                "Loan Status": status,
+                "Loan Count": len(group),
+                "Exposure": group[BALANCE_COL].sum(),
+                "Median LTV (%)": ltv.median(),
+                "Exposure-Wtd Avg LTV (%)": exposure_weighted_mean(group, "LTV (%)"),
+                "Median Tenor (Yrs)": tenor.median(),
+                "Exposure-Wtd Avg Tenor (Yrs)": exposure_weighted_mean(
+                    group.assign(**{"Analytical Tenor (Yrs)": tenor}),
+                    "Analytical Tenor (Yrs)",
+                ),
+                "Median Risk Rating": rating.median(),
+                "Exposure-Wtd Avg Risk Rating": exposure_weighted_mean(
+                    group,
+                    "Internal Risk Rating (1-10)",
+                ),
+            }
+        )
+
+    result = pd.DataFrame(rows)
+    order = {s: i for i, s in enumerate(normalized_status_order(working))}
+    result["_order"] = result["Loan Status"].map(lambda x: order.get(x, 99))
+    return result.sort_values("_order").drop(columns="_order")
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# Statistical-analysis helpers
+# -----------------------------------------------------------------------------
+STAT_NUMERIC_FEATURES = {
+    "Risk Rating": "Risk Rating",
+    "LTV": "LTV",
+    "Tenor": "Tenor",
+}
+
+STAT_CATEGORICAL_FEATURES = {
+    "Interest Rate Type": "Interest Rate Type",
+    "Geography (Region)": "Region",
+    "Industry": "Industry",
+    "Borrower Type": "Borrower Type",
+    "Facility Type": "Facility Type",
+    "Relationship Manager": "Relationship Manager",
+}
+
+
+def prepare_statistical_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create a modeling dataset without changing the underlying cleaned portfolio.
+
+    Outcome:
+      Higher Risk = 1 for Watchlist or Non-Performing, 0 for Performing.
+
+    Modeling fields:
+      - Risk Rating: numeric 1-10 scale.
+      - LTV: numeric percentage.
+      - Tenor: valid Implied Tenor when available, otherwise Stated Tenor.
+      - Log Exposure: log1p(Outstanding Balance), used only for clustering by default.
+
+    Rows with an unexpected Loan Status are excluded from the binary logistic outcome
+    rather than being silently forced into either class.
+    """
+    model_df = df.copy()
+
+    status = model_df["Loan Status"].astype("string")
+    valid_status = status.isin(PERFORMANCE_STATUS_ORDER)
+    model_df = model_df.loc[valid_status].copy()
+
+    model_df["Higher Risk"] = model_df["Loan Status"].isin(
+        ["Watchlist", "Non-Performing"]
+    ).astype(int)
+
+    model_df["Risk Rating"] = pd.to_numeric(
+        model_df["Internal Risk Rating (1-10)"],
+        errors="coerce",
+    )
+    model_df["LTV"] = pd.to_numeric(model_df["LTV (%)"], errors="coerce")
+
+    implied = pd.to_numeric(model_df.get("Implied Tenor (Yrs)"), errors="coerce")
+    stated = pd.to_numeric(model_df.get("Stated Tenor (Yrs)"), errors="coerce")
+    model_df["Tenor"] = implied.combine_first(stated)
+
+    exposure = pd.to_numeric(model_df[BALANCE_COL], errors="coerce")
+    # log1p reduces the influence of a few very large facilities when K-means computes
+    # Euclidean distance. The original exposure is still used for economic summaries.
+    model_df["Log Exposure"] = np.log1p(exposure.clip(lower=0))
+
+    return model_df
+
+
+def run_core_logistic_inference(model_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Fit a compact, interpretable binary logistic regression.
+
+    Core predictors:
+      Risk Rating, LTV, Tenor, Floating-rate indicator.
+
+    Continuous predictors are standardized before fitting, so their odds ratios represent
+    a one-standard-deviation increase. Floating is interpreted relative to Fixed.
+
+    Complete-case analysis is used here because inferential p-values / confidence intervals
+    are easier to interpret without model-based imputation. The broader regularized model
+    below uses imputation for prediction-oriented contributor ranking.
+
+    Returns an empty table plus diagnostics when the model cannot be estimated reliably.
+    """
+    core = model_df[
+        [
+            "Higher Risk",
+            "Risk Rating",
+            "LTV",
+            "Tenor",
+            "Interest Rate Type",
+        ]
+    ].copy()
+
+    core["Floating"] = (
+        core["Interest Rate Type"]
+        .astype("string")
+        .str.lower()
+        .eq("floating")
+        .fillna(False)
+        .astype(float)
+    )
+
+    core = core.drop(columns=["Interest Rate Type"]).dropna()
+
+    diagnostics = {
+        "n": len(core),
+        "events": int(core["Higher Risk"].sum()) if not core.empty else 0,
+        "non_events": int((1 - core["Higher Risk"]).sum()) if not core.empty else 0,
+        "converged": False,
+        "pseudo_r2": np.nan,
+        "llr_pvalue": np.nan,
+        "error": None,
+    }
+
+    if (
+        len(core) < 20
+        or core["Higher Risk"].nunique() < 2
+        or core["Higher Risk"].sum() < 3
+        or (1 - core["Higher Risk"]).sum() < 3
+    ):
+        diagnostics["error"] = "Insufficient complete observations or outcome variation."
+        return pd.DataFrame(), diagnostics
+
+    continuous = ["Risk Rating", "LTV", "Tenor"]
+    means = core[continuous].mean()
+    stds = core[continuous].std(ddof=0).replace(0, np.nan)
+
+    x = core[continuous + ["Floating"]].copy()
+    x[continuous] = (x[continuous] - means) / stds
+    x = x.replace([np.inf, -np.inf], np.nan).dropna()
+
+    y = core.loc[x.index, "Higher Risk"].astype(int)
+    x = sm.add_constant(x.astype(float), has_constant="add")
+
+    try:
+        result = sm.Logit(y, x).fit(disp=False, maxiter=200)
+
+        conf = result.conf_int()
+        rows = []
+        labels = {
+            "Risk Rating": "Risk Rating (per 1 SD worse)",
+            "LTV": "LTV (per 1 SD increase)",
+            "Tenor": "Tenor (per 1 SD increase)",
+            "Floating": "Floating vs Fixed",
+        }
+
+        for term in ["Risk Rating", "LTV", "Tenor", "Floating"]:
+            rows.append(
+                {
+                    "Predictor": labels[term],
+                    "Coefficient": result.params[term],
+                    "Odds Ratio": np.exp(result.params[term]),
+                    "95% CI Lower": np.exp(conf.loc[term, 0]),
+                    "95% CI Upper": np.exp(conf.loc[term, 1]),
+                    "p-value": result.pvalues[term],
+                }
+            )
+
+        diagnostics.update(
+            {
+                "converged": bool(result.mle_retvals.get("converged", True)),
+                "pseudo_r2": float(result.prsquared),
+                "llr_pvalue": float(result.llr_pvalue),
+            }
+        )
+        return pd.DataFrame(rows), diagnostics
+
+    except Exception as exc:
+        diagnostics["error"] = str(exc)
+        return pd.DataFrame(), diagnostics
+
+
+def build_regularized_logistic_pipeline(
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+) -> Pipeline:
+    """
+    Build an L2-regularized logistic model for exploratory contributor ranking.
+
+    Regularization is important because this case study has a small sample and some
+    high-cardinality categorical variables. It reduces coefficient instability but does
+    not turn the model into causal evidence.
+    """
+    transformers = []
+
+    if numeric_cols:
+        numeric_pipe = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]
+        )
+        transformers.append(("numeric", numeric_pipe, numeric_cols))
+
+    if categorical_cols:
+        categorical_pipe = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                (
+                    "onehot",
+                    OneHotEncoder(
+                        handle_unknown="ignore",
+                        drop="first",
+                        sparse_output=False,
+                    ),
+                ),
+            ]
+        )
+        transformers.append(("categorical", categorical_pipe, categorical_cols))
+
+    preprocessor = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+        verbose_feature_names_out=False,
+    )
+
+    return Pipeline(
+        steps=[
+            ("preprocess", preprocessor),
+            (
+                "model",
+                LogisticRegression(
+                    penalty="l2",
+                    C=1.0,
+                    solver="liblinear",
+                    max_iter=5000,
+                    random_state=42,
+                ),
+            ),
+        ]
+    )
+
+
+def run_regularized_contributor_model(
+    model_df: pd.DataFrame,
+    selected_display_features: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """
+    Fit a regularized logistic model and rank original variables by permutation importance.
+
+    Permutation importance is calculated at the original-column level, so a multi-level
+    field such as Region receives one overall importance score rather than a separate rank
+    for every one-hot dummy. This makes the ranking easier to interpret.
+
+    A coefficient table is also returned for directional interpretation. Coefficients for
+    categorical levels are relative to the omitted baseline level. Because the model is
+    regularized, these coefficient-based odds ratios are descriptive/model-based rather
+    than classical maximum-likelihood inferential estimates.
+    """
+    numeric_cols = [
+        STAT_NUMERIC_FEATURES[name]
+        for name in selected_display_features
+        if name in STAT_NUMERIC_FEATURES
+    ]
+    categorical_cols = [
+        STAT_CATEGORICAL_FEATURES[name]
+        for name in selected_display_features
+        if name in STAT_CATEGORICAL_FEATURES
+    ]
+    feature_cols = numeric_cols + categorical_cols
+
+    diagnostics = {
+        "n": 0,
+        "events": 0,
+        "non_events": 0,
+        "cv_auc_mean": np.nan,
+        "cv_auc_std": np.nan,
+        "encoded_features": 0,
+        "error": None,
+    }
+
+    if not feature_cols:
+        diagnostics["error"] = "Select at least one predictor."
+        return pd.DataFrame(), pd.DataFrame(), diagnostics
+
+    data = model_df[feature_cols + ["Higher Risk"]].copy()
+
+    # Normalize dtypes before scikit-learn preprocessing. Pandas nullable string columns
+    # may contain pd.NA, whose three-valued boolean semantics are not accepted by some
+    # sklearn imputers. Convert missing categoricals to ordinary np.nan/object and force
+    # numeric predictors through to_numeric. This changes representation, not values.
+    for col in numeric_cols:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+    for col in categorical_cols:
+        data[col] = data[col].astype(object)
+        data[col] = data[col].where(pd.notna(data[col]), np.nan)
+
+    # Do not drop rows for missing predictor values here: the pipeline explicitly imputes
+    # numeric/categorical fields so the ranking uses the full included analytical sample.
+    y = data.pop("Higher Risk").astype(int)
+    X = data
+
+    diagnostics.update(
+        {
+            "n": len(X),
+            "events": int(y.sum()),
+            "non_events": int((1 - y).sum()),
+        }
+    )
+
+    if y.nunique() < 2 or min(y.value_counts()) < 2:
+        diagnostics["error"] = "Insufficient outcome variation for logistic regression."
+        return pd.DataFrame(), pd.DataFrame(), diagnostics
+
+    pipe = build_regularized_logistic_pipeline(numeric_cols, categorical_cols)
+
+    try:
+        pipe.fit(X, y)
+
+        # Cross-validated ROC AUC: use as many folds as class counts reasonably support,
+        # capped at 5 for stability and runtime.
+        minority_count = int(y.value_counts().min())
+        n_splits = min(5, minority_count)
+        if n_splits >= 2:
+            cv = StratifiedKFold(
+                n_splits=n_splits,
+                shuffle=True,
+                random_state=42,
+            )
+            auc_scores = cross_val_score(
+                pipe,
+                X,
+                y,
+                cv=cv,
+                scoring="roc_auc",
+            )
+            diagnostics["cv_auc_mean"] = float(np.nanmean(auc_scores))
+            diagnostics["cv_auc_std"] = float(np.nanstd(auc_scores))
+
+        # Group-level contributor ranking on the original columns.
+        perm = permutation_importance(
+            pipe,
+            X,
+            y,
+            scoring="roc_auc",
+            n_repeats=30,
+            random_state=42,
+        )
+        importance = pd.DataFrame(
+            {
+                "Feature": feature_cols,
+                "Permutation Importance": perm.importances_mean,
+                "Importance SD": perm.importances_std,
+            }
+        ).sort_values("Permutation Importance", ascending=False)
+
+        # Directional coefficient table after preprocessing / one-hot encoding.
+        preprocess = pipe.named_steps["preprocess"]
+        model = pipe.named_steps["model"]
+        encoded_names = preprocess.get_feature_names_out()
+        coefs = model.coef_[0]
+
+        diagnostics["encoded_features"] = len(encoded_names)
+
+        coef_table = pd.DataFrame(
+            {
+                "Encoded Predictor": encoded_names,
+                "Coefficient": coefs,
+                "Model-based Odds Ratio": np.exp(coefs),
+            }
+        )
+        coef_table["Absolute Coefficient"] = coef_table["Coefficient"].abs()
+        coef_table = coef_table.sort_values("Absolute Coefficient", ascending=False)
+
+        return importance, coef_table, diagnostics
+
+    except Exception as exc:
+        diagnostics["error"] = str(exc)
+        return pd.DataFrame(), pd.DataFrame(), diagnostics
+
+
+def prepare_cluster_matrix(
+    model_df: pd.DataFrame,
+    selected_features: list[str],
+) -> tuple[pd.DataFrame, np.ndarray, SimpleImputer, StandardScaler]:
+    """
+    Prepare numeric risk features for K-means.
+
+    K-means uses Euclidean distance, so only numeric features are used here and every
+    selected variable is standardized. Categorical variables such as Region or Manager
+    are intentionally not one-hot encoded into the clustering distance because dozens of
+    sparse dummies can dominate a small-sample K-means solution.
+    """
+    cluster_map = {
+        "Risk Rating": "Risk Rating",
+        "LTV": "LTV",
+        "Tenor": "Tenor",
+        "Log Exposure": "Log Exposure",
+    }
+    cols = [cluster_map[name] for name in selected_features]
+
+    data = model_df[cols].copy()
+    for col in cols:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+
+    imputer = SimpleImputer(strategy="median")
+    scaler = StandardScaler()
+
+    imputed = imputer.fit_transform(data)
+    scaled = scaler.fit_transform(imputed)
+
+    return data, scaled, imputer, scaler
+
+
+def cluster_profile_table(
+    clustered_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Summarize each K-means segment using original economic units and performance outcomes.
+
+    Performance is not used to create the clusters; it is compared only after clustering.
+    That separation allows the dashboard to ask whether naturally occurring risk profiles
+    also exhibit different Watchlist / Non-Performing behavior.
+    """
+    rows = []
+
+    for cluster_name, group in clustered_df.groupby("Cluster", dropna=False):
+        exposure = pd.to_numeric(group[BALANCE_COL], errors="coerce").sum()
+        high_risk_exposure = pd.to_numeric(
+            group.loc[group["Higher Risk"].eq(1), BALANCE_COL],
+            errors="coerce",
+        ).sum()
+
+        rows.append(
+            {
+                "Cluster": cluster_name,
+                "Loan Count": len(group),
+                "Exposure": exposure,
+                "Exposure %": exposure / clustered_df[BALANCE_COL].sum()
+                if clustered_df[BALANCE_COL].sum()
+                else np.nan,
+                "Higher-Risk Loans %": group["Higher Risk"].mean(),
+                "Higher-Risk Exposure %": high_risk_exposure / exposure
+                if exposure
+                else np.nan,
+                "Avg Risk Rating": pd.to_numeric(
+                    group["Risk Rating"], errors="coerce"
+                ).mean(),
+                "Median LTV": pd.to_numeric(group["LTV"], errors="coerce").median(),
+                "Median Tenor": pd.to_numeric(group["Tenor"], errors="coerce").median(),
+                "Median Exposure": pd.to_numeric(
+                    group[BALANCE_COL], errors="coerce"
+                ).median(),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("Cluster").reset_index(drop=True)
+
+
+
+
 # -----------------------------------------------------------------------------
 # Page 1 — Cleaning and manual review
 # -----------------------------------------------------------------------------
@@ -689,7 +1426,7 @@ def render_cleaning_page() -> None:
         key="source_workbook_uploader",
         help=(
             "Once a workbook has been loaded, it remains available during this browser "
-            "session when you move between Data Cleaning, Portfolio Summary, and Workflow."
+            "session when you move between Data Cleaning, Portfolio Summary, Statistical Analysis, and Workflow."
         ),
     )
 
@@ -1122,11 +1859,486 @@ def render_summary_page() -> None:
 
 
 
+
 # -----------------------------------------------------------------------------
-# Page 3 — Cleaning workflow
+# Page 3 — Statistical analysis
+# -----------------------------------------------------------------------------
+def render_statistical_analysis_page() -> None:
+    st.title("3. Statistical Analysis")
+    st.caption(
+        "Exploratory models for identifying characteristics associated with weaker loan "
+        "performance and for detecting natural risk segments. Only rows with "
+        "Include in Analysis = TRUE are used."
+    )
+
+    if st.session_state.cleaned_df is None:
+        st.info("Go to **Data Cleaning**, upload the workbook, and run cleaning first.")
+        return
+
+    full_df = st.session_state.cleaned_df.copy()
+    include_mask = full_df["Include in Analysis"].fillna(False).astype(bool)
+    df = full_df.loc[include_mask].copy()
+
+    if df.empty:
+        st.warning(
+            "No records are currently included in analysis. "
+            "Return to Data Cleaning / Manual Review and select records for analysis."
+        )
+        return
+
+    model_df = prepare_statistical_dataset(df)
+    if model_df.empty or model_df["Higher Risk"].nunique() < 2:
+        st.warning("The included dataset does not have enough outcome variation for modeling.")
+        return
+
+    event_count = int(model_df["Higher Risk"].sum())
+    non_event_count = int((1 - model_df["Higher Risk"]).sum())
+    event_rate = event_count / len(model_df)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Modeling records", f"{len(model_df):,}")
+    c2.metric("Performing", f"{non_event_count:,}")
+    c3.metric("Higher Risk", f"{event_count:,}")
+    c4.metric("Higher-Risk Rate", f"{event_rate:.1%}")
+
+    st.info(
+        "**Binary outcome:** Higher Risk = Watchlist or Non-Performing; "
+        "Performing = 0. Results show association, not causation. "
+        "With a small portfolio sample, high-cardinality variables can overfit quickly."
+    )
+
+    tab_logistic, tab_cluster = st.tabs(
+        ["Logistic Regression", "Clustering / Risk Segmentation"]
+    )
+
+    # ------------------------------------------------------------------
+    # Logistic regression
+    # ------------------------------------------------------------------
+    with tab_logistic:
+        st.subheader("A. Core Logistic Regression — inferential view")
+        st.caption(
+            "A deliberately compact model uses Risk Rating, LTV, Tenor, and Fixed/Floating. "
+            "Continuous predictors are standardized, so their odds ratios correspond to a "
+            "1-standard-deviation increase. This keeps the number of parameters reasonable "
+            "relative to the number of higher-risk observations."
+        )
+
+        core_table, core_diag = run_core_logistic_inference(model_df)
+
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Complete-case N", f"{core_diag['n']:,}")
+        d2.metric("Higher-risk events", f"{core_diag['events']:,}")
+        d3.metric(
+            "Pseudo R²",
+            f"{core_diag['pseudo_r2']:.3f}"
+            if pd.notna(core_diag["pseudo_r2"])
+            else "—",
+        )
+        d4.metric(
+            "Model LLR p-value",
+            f"{core_diag['llr_pvalue']:.3f}"
+            if pd.notna(core_diag["llr_pvalue"])
+            else "—",
+        )
+
+        if core_table.empty:
+            st.warning(
+                "Core logistic model could not be estimated reliably. "
+                f"{core_diag.get('error') or ''}"
+            )
+        else:
+            core_display = core_table.copy()
+            for col in ["Coefficient", "Odds Ratio", "95% CI Lower", "95% CI Upper"]:
+                core_display[col] = core_display[col].map(lambda x: f"{x:.3f}")
+            core_display["p-value"] = core_display["p-value"].map(lambda x: f"{x:.3f}")
+
+            st.dataframe(
+                core_display[
+                    [
+                        "Predictor",
+                        "Odds Ratio",
+                        "95% CI Lower",
+                        "95% CI Upper",
+                        "p-value",
+                        "Coefficient",
+                    ]
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            or_plot = core_table.copy()
+            or_plot["CI Low Error"] = (
+                or_plot["Odds Ratio"] - or_plot["95% CI Lower"]
+            )
+            or_plot["CI High Error"] = (
+                or_plot["95% CI Upper"] - or_plot["Odds Ratio"]
+            )
+            fig = px.scatter(
+                or_plot,
+                x="Odds Ratio",
+                y="Predictor",
+                error_x="CI High Error",
+                error_x_minus="CI Low Error",
+                title="Core model odds ratios with 95% confidence intervals",
+            )
+            fig.add_vline(x=1.0, line_dash="dash")
+            fig.update_yaxes(categoryorder="array", categoryarray=or_plot["Predictor"].tolist())
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.caption(
+                "Odds Ratio > 1 indicates higher modeled odds of Watchlist/Non-Performing; "
+                "Odds Ratio < 1 indicates lower modeled odds. A confidence interval crossing "
+                "1 indicates the association is not statistically precise at the 95% level."
+            )
+
+        st.markdown("---")
+        st.subheader("B. Regularized Contributor Ranking — broader exploratory view")
+
+        all_options = [
+            "Risk Rating",
+            "LTV",
+            "Tenor",
+            "Interest Rate Type",
+            "Geography (Region)",
+            "Borrower Type",
+            "Facility Type",
+            "Industry",
+            "Relationship Manager",
+        ]
+        default_options = [
+            "Risk Rating",
+            "LTV",
+            "Tenor",
+            "Interest Rate Type",
+            "Geography (Region)",
+            "Borrower Type",
+            "Facility Type",
+        ]
+
+        selected = st.multiselect(
+            "Predictors",
+            options=all_options,
+            default=default_options,
+            help=(
+                "Industry and Relationship Manager are available but are not selected by "
+                "default because they have many levels relative to this small dataset."
+            ),
+        )
+
+        high_cardinality_selected = [
+            name
+            for name in selected
+            if name in {"Industry", "Relationship Manager"}
+        ]
+        if high_cardinality_selected:
+            st.warning(
+                "High-cardinality predictor(s) selected: "
+                + ", ".join(high_cardinality_selected)
+                + ". With this sample size, their detailed coefficients can be unstable. "
+                  "Use permutation importance as an exploratory ranking, not proof of causality."
+            )
+
+        importance, coef_table, reg_diag = run_regularized_contributor_model(
+            model_df,
+            selected,
+        )
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Model N", f"{reg_diag['n']:,}")
+        r2.metric("Higher-risk events", f"{reg_diag['events']:,}")
+        r3.metric(
+            "Cross-validated ROC AUC",
+            (
+                f"{reg_diag['cv_auc_mean']:.3f} ± {reg_diag['cv_auc_std']:.3f}"
+                if pd.notna(reg_diag["cv_auc_mean"])
+                else "—"
+            ),
+        )
+        r4.metric("Encoded parameters", f"{reg_diag['encoded_features']:,}")
+
+        if reg_diag.get("error"):
+            st.warning(reg_diag["error"])
+        elif not importance.empty:
+            importance_plot = importance.sort_values(
+                "Permutation Importance",
+                ascending=True,
+            )
+            fig = px.bar(
+                importance_plot,
+                x="Permutation Importance",
+                y="Feature",
+                orientation="h",
+                error_x="Importance SD",
+                title="Exploratory contributor ranking by permutation importance",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            importance_display = importance.copy()
+            importance_display["Permutation Importance"] = importance_display[
+                "Permutation Importance"
+            ].map(lambda x: f"{x:.4f}")
+            importance_display["Importance SD"] = importance_display["Importance SD"].map(
+                lambda x: f"{x:.4f}"
+            )
+            st.dataframe(
+                importance_display,
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            with st.expander("Directional coefficient details"):
+                coef_display = coef_table.head(25).copy()
+                coef_display["Coefficient"] = coef_display["Coefficient"].map(
+                    lambda x: f"{x:.3f}"
+                )
+                coef_display["Model-based Odds Ratio"] = coef_display[
+                    "Model-based Odds Ratio"
+                ].map(lambda x: f"{x:.3f}")
+                coef_display["Absolute Coefficient"] = coef_display[
+                    "Absolute Coefficient"
+                ].map(lambda x: f"{x:.3f}")
+                st.dataframe(
+                    coef_display,
+                    hide_index=True,
+                    use_container_width=True,
+                )
+                st.caption(
+                    "Categorical coefficients are relative to an omitted baseline level. "
+                    "These are L2-regularized model coefficients and do not have classical "
+                    "maximum-likelihood p-values."
+                )
+
+        st.warning(
+            "**Interpretation control:** A contributor ranking means the variable helps the "
+            "model distinguish Higher Risk from Performing in this sample. It does not mean "
+            "the variable causes deterioration. Internal Risk Rating may itself incorporate "
+            "information about borrower deterioration, so strong association with Loan Status "
+            "is expected rather than causal."
+        )
+
+    # ------------------------------------------------------------------
+    # Clustering
+    # ------------------------------------------------------------------
+    with tab_cluster:
+        st.subheader("K-means Risk Segmentation")
+        st.caption(
+            "Clustering is unsupervised: Loan Status is NOT used to create clusters. "
+            "After clusters are formed from numeric risk characteristics, performance is "
+            "compared across clusters."
+        )
+
+        cluster_options = ["Risk Rating", "LTV", "Tenor", "Log Exposure"]
+        cluster_features = st.multiselect(
+            "Clustering features",
+            options=cluster_options,
+            default=cluster_options,
+            help=(
+                "All selected variables are median-imputed and standardized before K-means. "
+                "Log Exposure is used instead of raw exposure to reduce extreme scale effects."
+            ),
+            key="cluster_features",
+        )
+
+        if len(cluster_features) < 2:
+            st.info("Select at least two clustering features.")
+        else:
+            raw_cluster_data, scaled, _, _ = prepare_cluster_matrix(
+                model_df,
+                cluster_features,
+            )
+
+            n_obs = len(model_df)
+            max_k = min(6, n_obs - 1)
+            silhouette_rows = []
+
+            if max_k >= 2:
+                for k in range(2, max_k + 1):
+                    km = KMeans(
+                        n_clusters=k,
+                        random_state=42,
+                        n_init=20,
+                    )
+                    labels = km.fit_predict(scaled)
+                    if len(set(labels)) > 1:
+                        score = silhouette_score(scaled, labels)
+                    else:
+                        score = np.nan
+                    silhouette_rows.append({"k": k, "Silhouette Score": score})
+
+            silhouette_df = pd.DataFrame(silhouette_rows)
+
+            if silhouette_df.empty:
+                st.warning("Not enough observations to estimate multiple clusters.")
+            else:
+                best_k = int(
+                    silhouette_df.loc[
+                        silhouette_df["Silhouette Score"].idxmax(),
+                        "k",
+                    ]
+                )
+
+                left, right = st.columns([1, 2])
+
+                with left:
+                    chosen_k = st.selectbox(
+                        "Number of clusters",
+                        options=silhouette_df["k"].astype(int).tolist(),
+                        index=silhouette_df["k"].astype(int).tolist().index(best_k),
+                        help=(
+                            "The default is the k with the highest silhouette score. "
+                            "Cluster numbering itself is arbitrary."
+                        ),
+                    )
+
+                with right:
+                    sil_fig = px.line(
+                        silhouette_df,
+                        x="k",
+                        y="Silhouette Score",
+                        markers=True,
+                        title="Silhouette score by number of clusters",
+                    )
+                    st.plotly_chart(sil_fig, use_container_width=True)
+
+                kmeans = KMeans(
+                    n_clusters=int(chosen_k),
+                    random_state=42,
+                    n_init=20,
+                )
+                labels = kmeans.fit_predict(scaled)
+
+                clustered = model_df.copy()
+                clustered["Cluster"] = pd.Series(
+                    labels,
+                    index=clustered.index,
+                ).map(lambda x: f"Cluster {int(x) + 1}")
+
+                profile = cluster_profile_table(clustered)
+                display_profile = profile.copy()
+                display_profile["Exposure"] = display_profile["Exposure"].map(
+                    format_currency
+                )
+                display_profile["Median Exposure"] = display_profile[
+                    "Median Exposure"
+                ].map(format_currency)
+
+                for pct_col in [
+                    "Exposure %",
+                    "Higher-Risk Loans %",
+                    "Higher-Risk Exposure %",
+                ]:
+                    display_profile[pct_col] = display_profile[pct_col].map(
+                        lambda x: f"{x:.1%}" if pd.notna(x) else "—"
+                    )
+
+                for num_col in [
+                    "Avg Risk Rating",
+                    "Median LTV",
+                    "Median Tenor",
+                ]:
+                    display_profile[num_col] = display_profile[num_col].map(
+                        lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+                    )
+
+                st.markdown("**Cluster profile**")
+                st.dataframe(
+                    display_profile,
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                # Compare performance after clustering. This is deliberately post-hoc:
+                # outcome status played no role in the K-means fit.
+                cluster_mix, _ = performance_mix_by_dimension(
+                    clustered,
+                    "Cluster",
+                )
+                mix_fig = px.bar(
+                    cluster_mix,
+                    x="Cluster",
+                    y="Exposure Share",
+                    color="Loan Status",
+                    barmode="stack",
+                    title="Loan performance mix by cluster",
+                    category_orders={
+                        "Loan Status": normalized_status_order(clustered)
+                    },
+                    hover_data={
+                        "Exposure": ":,.0f",
+                        "Loan_Count": True,
+                        "Exposure Share": ":.1%",
+                    },
+                )
+                mix_fig.update_yaxes(tickformat=".0%", range=[0, 1])
+                st.plotly_chart(mix_fig, use_container_width=True)
+
+                # PCA is used only as a 2D visualization of the standardized K-means space.
+                # It is not used to rank contributors to performance.
+                pca = PCA(n_components=2, random_state=42)
+                coords = pca.fit_transform(scaled)
+                pca_df = clustered[
+                    [
+                        "Loan ID",
+                        "Borrower Name",
+                        "Loan Status",
+                        BALANCE_COL,
+                        "Cluster",
+                    ]
+                ].copy()
+                pca_df["PC1"] = coords[:, 0]
+                pca_df["PC2"] = coords[:, 1]
+
+                pca_fig = px.scatter(
+                    pca_df,
+                    x="PC1",
+                    y="PC2",
+                    color="Cluster",
+                    symbol="Loan Status",
+                    hover_data=[
+                        "Loan ID",
+                        "Borrower Name",
+                        BALANCE_COL,
+                    ],
+                    title=(
+                        "2D visualization of cluster space "
+                        f"(PCA explains {pca.explained_variance_ratio_.sum():.1%} of variance)"
+                    ),
+                )
+                st.plotly_chart(pca_fig, use_container_width=True)
+
+                with st.expander("Loan-level cluster assignments"):
+                    assignment = clustered[
+                        [
+                            "Loan ID",
+                            "Borrower Name",
+                            "Loan Status",
+                            "Cluster",
+                            "Risk Rating",
+                            "LTV",
+                            "Tenor",
+                            BALANCE_COL,
+                        ]
+                    ].copy()
+                    st.dataframe(
+                        assignment.sort_values(["Cluster", "Loan ID"]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                st.caption(
+                    "Cluster labels are descriptive segments, not credit grades. "
+                    "A cluster with a higher Watchlist/Non-Performing share may identify a "
+                    "risk profile worth further review, but clustering alone does not establish "
+                    "which variable causes weak performance."
+                )
+
+
+# -----------------------------------------------------------------------------
+# Page 4 — Cleaning workflow
 # -----------------------------------------------------------------------------
 def render_workflow_page() -> None:
-    st.title("3. Cleaning Workflow")
+    st.title("4. Cleaning Workflow")
     st.caption(
         "End-to-end data-quality workflow used in the case study. "
         "Deterministic issues are corrected automatically; ambiguous issues are flagged "
@@ -1381,6 +2593,7 @@ def main() -> None:
         [
             "Data Cleaning",
             "Portfolio Summary",
+            "Statistical Analysis",
             "Workflow",
         ],
     )
@@ -1415,6 +2628,8 @@ def main() -> None:
         render_cleaning_page()
     elif page == "Portfolio Summary":
         render_summary_page()
+    elif page == "Statistical Analysis":
+        render_statistical_analysis_page()
     else:
         render_workflow_page()
 
