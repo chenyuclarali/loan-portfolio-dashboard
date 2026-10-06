@@ -12,17 +12,11 @@ Dependencies:
     pip install pandas openpyxl rapidfuzz
 
 Design principle:
-    - One function per major data-quality issue so each rule is easy to explain, test,
-      and revise independently.
-    - Correct deterministic issues only when the intended value is supported by the
-      field definition or an explicit mapping.
-    - Flag uncertain issues rather than guessing; a statistical anomaly is not the
-      same thing as an incorrect investment record.
-    - Preserve an audit trail in a Data_Quality_Log sheet so every transformation or
-      unresolved exception can be traced back to the source value.
+    - One function per major data-quality issue.
+    - Correct deterministic issues.
+    - Flag uncertain issues rather than guessing.
+    - Preserve an audit trail in a Data_Quality_Log sheet.
     - Separate resolved corrections from unresolved items requiring manual review.
-      This distinction is important because a logged issue does not necessarily mean
-      the record should be excluded from portfolio analysis.
 """
 
 from __future__ import annotations
@@ -70,13 +64,7 @@ def validate_row_count(
     issues: list[dict],
     expected_rows: int = 100,
 ) -> pd.DataFrame:
-    """
-    Flag if the extract contains a different number of records than expected.
-
-    This is a portfolio-level completeness check, not a row-level error.  The
-    available rows are retained because the script cannot reconstruct a missing
-    record without a source system.
-    """
+    """Flag if the extract contains a different number of records than expected."""
     actual_rows = len(df)
     if actual_rows != expected_rows:
         add_issue(
@@ -149,13 +137,7 @@ def standardize_categories(
     df: pd.DataFrame,
     issues: list[dict],
 ) -> pd.DataFrame:
-    """
-    Map known spelling/case/abbreviation variants to a canonical category.
-
-    These are deterministic mappings defined from the case-study vocabulary.  The
-    function intentionally does not use fuzzy matching here; less-certain text
-    anomalies are handled later by RapidFuzz as review-only flags.
-    """
+    """Map obvious spelling/case variants to one canonical category."""
     df = df.copy()
 
     mappings = {
@@ -212,12 +194,8 @@ def clean_outstanding_balance(
 ) -> pd.DataFrame:
     """
     Convert balance to numeric.
-
-    For this case study, a negative loan balance is treated as a likely sign-entry
-    error and converted to its absolute value so exposure-based analysis can proceed.
-    This is an explicit analytical assumption, not a universal accounting rule:
-    a negative balance could have another economic meaning in a production system,
-    so the original value is logged and the record remains subject to manual review.
+    Negative balances are treated as sign-entry errors for this case study
+    and converted to absolute values, with the assumption explicitly logged.
     """
     df = df.copy()
 
@@ -257,17 +235,10 @@ def clean_interest_rate_fields(
     Enforce the case-study field logic:
       - Fixed loans use Fixed Rate (%).
       - Floating loans use Base Rate Index + Margin (bps).
-
-    Cross-field contradictions are corrected only when the field is structurally not
-    applicable (for example, a floating-rate loan should not carry a fixed-rate field).
-    Missing required fields are not imputed because the benchmark or spread cannot be
-    inferred safely from the other portfolio attributes.
     """
     df = df.copy()
 
     # Parse Fixed Rate (%), including values such as "525bps".
-    # 100 bps = 1 percentage point, so 525 bps becomes 5.25%.  This is a unit
-    # conversion, not an estimate of the loan's coupon.
     fixed_col = "Fixed Rate (%)"
     original_fixed = df[fixed_col].copy()
 
@@ -397,11 +368,7 @@ def clean_risk_rating(
 ) -> pd.DataFrame:
     """
     Valid scale is 1 (strongest) through 10 (weakest).
-
-    Invalid values such as 0, 12, or NR are converted to missing and logged.  They are
-    not clipped to the nearest valid score because doing so would invent a credit
-    opinion that is not supported by the source data.  In summaries, these records can
-    still contribute exposure while the rating itself is shown as Unrated / Invalid.
+    Invalid values such as 0, 12, or NR are converted to missing and logged.
     """
     df = df.copy()
 
@@ -436,14 +403,7 @@ def clean_dates_and_validate_tenor(
 ) -> pd.DataFrame:
     """
     Parse dates, flag missing/illogical dates, and calculate implied tenor.
-
-    ``dayfirst=True`` is used because the case-study text dates follow a day/month/year
-    convention.  If a production source uses a different convention, this parsing rule
-    should be replaced with an explicit source-format contract.
-
-    The function does not invent a corrected maturity date when source information is
-    unavailable.  Instead, it derives an implied tenor only when both dates are valid
-    and chronologically consistent.
+    Do not invent a corrected maturity date when source information is unavailable.
     """
     df = df.copy()
 
@@ -521,9 +481,7 @@ def clean_dates_and_validate_tenor(
         df["Stated Tenor (Yrs)"], errors="coerce"
     )
 
-    # A difference greater than 0.5 year is treated as material.  The tolerance
-    # avoids flagging small discrepancies caused by day-count conventions, leap years,
-    # or rounded stated tenors.  It is a case-study QA threshold, not a credit-policy rule.
+    # Difference > 0.5 year is treated as a material mismatch.
     tenor_mismatch = (
         valid_date_order
         & df["Stated Tenor (Yrs)"].notna()
@@ -553,12 +511,9 @@ def clean_and_validate_ltv(
 ) -> pd.DataFrame:
     """
     Convert LTV to numeric.
-
-    Negative LTV is treated as invalid because it is not economically meaningful under
-    the usual loan-to-value definition and is therefore set to missing pending review.
-    LTV above 100% is retained because it can be economically real (for example after
-    collateral deterioration or an over-advance).  High LTV is therefore a review flag,
-    not an automatic correction or cap at 100%.
+    Negative LTV is invalid and is set to missing.
+    LTV above 100% is retained but flagged because it can be economically possible
+    (e.g., collateral value deterioration) and should not be automatically corrected.
     """
     df = df.copy()
 
@@ -607,11 +562,7 @@ def flag_duplicates(
 ) -> pd.DataFrame:
     """
     Flag duplicate Loan IDs and potential duplicate facilities.
-
-    A duplicate identifier does not prove that the underlying exposure is duplicated;
-    it may instead indicate a key-entry problem.  Likewise, matching borrower/facility
-    attributes can still represent separate tranches or facilities.  The script therefore
-    retains both rows and requires source-system confirmation before any deletion.
+    Do not delete records when the evidence is ambiguous.
     """
     df = df.copy()
 
@@ -627,9 +578,8 @@ def flag_duplicates(
             loan_id=df.at[idx, "Loan ID"],
         )
 
-    # Conservative potential-duplicate rule: same borrower + facility + balance +
-    # origination + maturity.  Matching these fields is enough to warrant review, but
-    # not enough to conclude that one row is redundant.
+    # Conservative potential-duplicate rule:
+    # same borrower + facility + balance + origination + maturity.
     duplicate_keys = [
         "Borrower Name",
         "Facility Type",
@@ -665,14 +615,7 @@ def flag_exposure_outliers(
 ) -> pd.DataFrame:
     """
     Flag extreme balance outliers using a conservative 3*IQR rule.
-
-    Threshold = Q3 + 3 * (Q3 - Q1).  A 3*IQR rule is intentionally more conservative
-    than the common 1.5*IQR exploratory-data threshold because credit portfolios are
-    often naturally right-skewed and may contain legitimately large exposures.
-
-    Outliers are never winsorized, deleted, or resized automatically.  The flag asks
-    the reviewer to verify amount, currency/unit, and facility structure because a large
-    exposure may be both valid and strategically important for concentration analysis.
+    Outliers are not changed; this is a review flag, not a correction.
     """
     df = df.copy()
 
@@ -720,7 +663,7 @@ def flag_fuzzy_text_anomalies(
     borrower_threshold: float = 93.0,
 ) -> pd.DataFrame:
     """
-    Run AFTER the deterministic cleaning functions as a secondary QA layer.
+    Run AFTER the deterministic cleaning functions.
 
     This function is deliberately flag-only:
       - It does NOT automatically revise values.
@@ -731,16 +674,10 @@ def flag_fuzzy_text_anomalies(
     Rationale:
       Fuzzy matching is useful for finding issues that were not anticipated in the
       explicit mapping dictionary, but similarity alone is not sufficient evidence
-      to overwrite investment data.  The 85% category and 93% borrower-name thresholds
-      are screening heuristics for this case study, not business-policy thresholds.
-      Borrower names use the higher threshold because distinct legal entities can have
-      very similar names.
+      to overwrite investment data.
     """
     df = df.copy()
 
-    # Expected values represent the controlled vocabulary observed/expected in this
-    # case study.  A production implementation should source these lists from a formal
-    # data dictionary or reference table rather than hard-code them here.
     expected_values = {
         "Region": [
             "Africa", "Asia Pacific", "Europe", "Latin America",
@@ -900,11 +837,7 @@ def classify_manual_review_issues(
     """
     Add a Manual Review Required field to every audit-log issue.
 
-    The distinction is intentional because the audit log contains both historical
-    corrections and still-open exceptions.  A row can therefore have an Issue Summary
-    while no longer requiring manual review.
-
-    Classification logic:
+    The distinction is intentional:
       - Deterministic corrections (whitespace, known category mappings, unit
         conversion, clearing fields that are not applicable) are logged but
         do not require further review.
@@ -957,25 +890,11 @@ def add_manual_review_flags(
     issues: list[dict],
 ) -> pd.DataFrame:
     """
-    Add final row-level review and analysis-inclusion fields to Cleaned_Data:
+    Add final decision fields to Cleaned_Data:
       - Manual Review Required: TRUE only for unresolved issues.
       - Manual Review Reason: semicolon-separated unresolved descriptions.
-      - Include in Analysis: default analytical eligibility.
-
-    Default inclusion rule:
-      - Rows with no unresolved manual-review issue are automatically included.
-      - Rows requiring manual review are excluded from analysis by default until a
-        reviewer explicitly changes Include in Analysis in the dashboard.
-
-    This conservative default prevents an unresolved record from silently affecting
-    portfolio statistics while still preserving the row in Cleaned_Data for review.
 
     Portfolio-level issues without a Loan ID remain in Data_Quality_Log only.
-
-    Review reasons are mapped by Loan ID in the standalone cleaner.  Therefore, if the
-    source contains a duplicated Loan ID, both rows conservatively inherit that ID-level
-    review status.  The Streamlit dashboard adds a separate internal Record ID so manual
-    edits can still target the correct physical row.
     """
     df = df.copy()
 
@@ -1005,14 +924,6 @@ def add_manual_review_flags(
         lambda x: "; ".join(review_map.get(str(x), []))
     ).fillna("")
 
-    # Analysis inclusion is intentionally separate from review status.
-    # The automated cleaner only sets the *initial* default:
-    #   no manual review -> include;
-    #   manual review required -> exclude.
-    # In the Streamlit dashboard the reviewer may later change Include in Analysis
-    # manually, independent of Reviewer Decision or Manual Review Required.
-    df["Include in Analysis"] = ~df["Manual Review Required"].fillna(False).astype(bool)
-
     return df
 
 
@@ -1023,13 +934,7 @@ def add_issue_summary(
     df: pd.DataFrame,
     issues: list[dict],
 ) -> pd.DataFrame:
-    """
-    Add a compact list of all issue types ever detected for each loan.
-
-    ``Issue Summary`` is an audit/history field and should not be interpreted as an
-    unresolved-status field.  ``Manual Review Required`` is the authoritative indicator
-    of whether further review is still needed.
-    """
+    """Add one readable Issue Summary field to each cleaned loan record."""
     df = df.copy()
 
     issue_map: dict[str, list[str]] = {}
@@ -1058,14 +963,7 @@ def add_issue_summary(
 # Main cleaning pipeline
 # ---------------------------------------------------------------------------
 def clean_loan_portfolio(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Run the cleaning functions in a transparent, auditable order.
-
-    Order matters: deterministic normalization is performed first, then business-rule
-    validation, then secondary fuzzy QA, and finally unresolved-vs-resolved review
-    classification.  This prevents fuzzy matching or later checks from overwriting
-    values that were already deterministically standardized.
-    """
+    """Run the cleaning functions in a transparent, auditable order."""
     issues: list[dict] = []
 
     df = validate_row_count(df, issues)
@@ -1081,8 +979,6 @@ def clean_loan_portfolio(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = flag_fuzzy_text_anomalies(df, issues)
 
     # Final classification: distinguish resolved corrections from unresolved items.
-    # add_manual_review_flags() also initializes Include in Analysis:
-    # unresolved row-level review items default to FALSE; all other rows default TRUE.
     issues = classify_manual_review_issues(issues)
     df = add_manual_review_flags(df, issues)
     df = add_issue_summary(df, issues)
