@@ -1,54 +1,81 @@
-Loan Portfolio Cleaning & Credit Review Dashboard
-=================================================
+# Loan Portfolio Dashboard v4
 
-Sidebar navigation
-------------------
-Case Study
-  - Data Cleaning
-  - Portfolio Summary
-  - Workflow
+## Pages
 
-Files required in the same folder:
-  1. loan_portfolio_dashboard_with_workflow.py
-  2. clean_loan_portfolio_FINAL.py
-  3. requirements.txt
+1. Data Cleaning
+2. Portfolio Summary
+3. Statistical Analysis
+4. Workflow
 
-Install dependencies:
-  python -m pip install -r requirements.txt
+## Statistical Analysis
 
-Run the dashboard:
-  python -m streamlit run loan_portfolio_dashboard_with_workflow.py
+### Logistic Regression
 
-Data Cleaning
--------------
-- Upload the raw case-study Excel workbook.
-- Select Loan_Portfolio_Data.
-- Run automated cleaning.
-- Review Cleaned Data and the validation log.
-- Edit records with Manual Review Required = TRUE.
-- Use "Verified - keep as-is" only after confirming an unusual value is correct.
-- Apply revisions and rerun checks.
-- Download the current cleaned workbook.
+Outcome:
+- `Higher Risk = 1`: Watchlist or Non-Performing
+- `Higher Risk = 0`: Performing
 
-Portfolio Summary
------------------
-- Portfolio composition by geography, industry, borrower type, and facility type.
-- Fixed vs. floating exposure.
-- Risk rating and loan-status distributions.
-- Borrower/category concentrations.
-- Assumptions and data-treatment table.
+Two views are provided:
 
-Workflow
---------
-- Interactive workflow chart showing the full cleaning process.
-- Green nodes = deterministic corrections.
-- Orange nodes = validation / flag-only checks.
-- Red nodes = manual review and revalidation loop.
-- RapidFuzz is shown explicitly as a flag-only secondary QA control.
-- Current open-review metrics appear when a workbook has been loaded.
+1. **Core inferential logistic model**
+   - Risk Rating
+   - LTV
+   - Tenor
+   - Floating vs Fixed
+   - Odds ratio
+   - 95% confidence interval
+   - p-value
 
-Notes
------
-- Summary percentages are exposure-weighted using Outstanding Balance.
-- Open manual-review rows are included in the base-case summary by default.
-- A toggle provides a sensitivity view excluding open review rows.
+   Numeric predictors are standardized, so the odds ratio represents a 1-SD increase.
+
+2. **Regularized contributor ranking**
+   - L2 logistic regression
+   - selectable predictors:
+     Risk Rating, LTV, Tenor, Rate Type, Region, Industry,
+     Borrower Type, Facility Type, Relationship Manager
+   - cross-validated ROC AUC
+   - permutation importance by original variable
+   - detailed regularized coefficients / model-based odds ratios
+
+   Industry and Relationship Manager are not selected by default because their
+   high cardinality can overfit a small sample.
+
+### Clustering
+
+K-means uses numeric risk characteristics only:
+- Risk Rating
+- LTV
+- Tenor
+- Log Exposure
+
+Steps:
+- median imputation
+- standardization
+- silhouette-score comparison for k
+- K-means segmentation
+- cluster risk/performance profile
+- exposure-weighted Loan Status mix
+- PCA used only as a 2D visualization of cluster space
+
+Loan Status is NOT used to form clusters.
+
+## Interpretation
+
+All statistical outputs are exploratory associations / segmentation, not causal estimates.
+Portfolio Summary continues to use only `Include in Analysis = TRUE`.
+
+## Run
+
+```powershell
+python -m pip install -r requirements.txt
+python -m streamlit run loan_portfolio_dashboard.py
+```
+
+## Model interpretation guardrails
+
+- Cross-validated ROC AUC is displayed to show whether the logistic model generalizes.
+- Permutation importance can be near zero or negative; this indicates weak or unstable
+  predictive contribution rather than evidence that a factor is protective.
+- If ROC AUC is near or below 0.5, the dashboard should be interpreted as showing that
+  the selected predictors do not provide stable predictive discrimination in this sample.
+- Clusters are unsupervised descriptive segments, not credit grades or causal groups.
