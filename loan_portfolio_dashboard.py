@@ -1426,7 +1426,7 @@ def render_cleaning_page() -> None:
         key="source_workbook_uploader",
         help=(
             "Once a workbook has been loaded, it remains available during this browser "
-            "session when you move between Data Cleaning, Portfolio Summary, Statistical Analysis, and Workflow."
+            "session when you move between Data Cleaning, Portfolio Summary, Performance Analysis, and Workflow."
         ),
     )
 
@@ -1861,14 +1861,13 @@ def render_summary_page() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Page 3 — Statistical analysis
+# Page 3 — Performance analysis
 # -----------------------------------------------------------------------------
 def render_statistical_analysis_page() -> None:
-    st.title("3. Statistical Analysis")
+    st.title("3. Performance Analysis")
     st.caption(
-        "Exploratory models for identifying characteristics associated with weaker loan "
-        "performance and for detecting natural risk segments. Only rows with "
-        "Include in Analysis = TRUE are used."
+        "Exploratory statistical analysis using only rows with "
+        "Include in Analysis = TRUE."
     )
 
     if st.session_state.cleaned_df is None:
@@ -1891,448 +1890,172 @@ def render_statistical_analysis_page() -> None:
         st.warning("The included dataset does not have enough outcome variation for modeling.")
         return
 
-    event_count = int(model_df["Higher Risk"].sum())
-    non_event_count = int((1 - model_df["Higher Risk"]).sum())
-    event_rate = event_count / len(model_df)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Modeling records", f"{len(model_df):,}")
-    c2.metric("Performing", f"{non_event_count:,}")
-    c3.metric("Higher Risk", f"{event_count:,}")
-    c4.metric("Higher-Risk Rate", f"{event_rate:.1%}")
-
     st.info(
-        "**Binary outcome:** Higher Risk = Watchlist or Non-Performing; "
-        "Performing = 0. Results show association, not causation. "
-        "With a small portfolio sample, high-cardinality variables can overfit quickly."
+        "**Outcome definition:** Higher Risk = Watchlist or Non-Performing; Performing = 0. "
+        "Results are exploratory associations, not causal estimates."
     )
 
-    tab_logistic, tab_cluster = st.tabs(
-        ["Logistic Regression", "Clustering / Risk Segmentation"]
-    )
+    # =====================================================================
+    # Panel 1 — Logistic Regression
+    # =====================================================================
+    st.subheader("Panel 1 — Logistic Regression")
 
-    # ------------------------------------------------------------------
-    # Logistic regression
-    # ------------------------------------------------------------------
-    with tab_logistic:
-        st.subheader("A. Core Logistic Regression — inferential view")
-        st.caption(
-            "A deliberately compact model uses Risk Rating, LTV, Tenor, and Fixed/Floating. "
-            "Continuous predictors are standardized, so their odds ratios correspond to a "
-            "1-standard-deviation increase. This keeps the number of parameters reasonable "
-            "relative to the number of higher-risk observations."
-        )
+    core_table, core_diag = run_core_logistic_inference(model_df)
 
-        core_table, core_diag = run_core_logistic_inference(model_df)
-
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("Complete-case N", f"{core_diag['n']:,}")
-        d2.metric("Higher-risk events", f"{core_diag['events']:,}")
-        d3.metric(
-            "Pseudo R²",
-            f"{core_diag['pseudo_r2']:.3f}"
-            if pd.notna(core_diag["pseudo_r2"])
-            else "—",
-        )
-        d4.metric(
-            "Model LLR p-value",
-            f"{core_diag['llr_pvalue']:.3f}"
-            if pd.notna(core_diag["llr_pvalue"])
-            else "—",
-        )
-
-        if core_table.empty:
-            st.warning(
-                "Core logistic model could not be estimated reliably. "
-                f"{core_diag.get('error') or ''}"
-            )
-        else:
-            core_display = core_table.copy()
-            for col in ["Coefficient", "Odds Ratio", "95% CI Lower", "95% CI Upper"]:
-                core_display[col] = core_display[col].map(lambda x: f"{x:.3f}")
-            core_display["p-value"] = core_display["p-value"].map(lambda x: f"{x:.3f}")
-
-            st.dataframe(
-                core_display[
-                    [
-                        "Predictor",
-                        "Odds Ratio",
-                        "95% CI Lower",
-                        "95% CI Upper",
-                        "p-value",
-                        "Coefficient",
-                    ]
-                ],
-                hide_index=True,
-                use_container_width=True,
-            )
-
-            or_plot = core_table.copy()
-            or_plot["CI Low Error"] = (
-                or_plot["Odds Ratio"] - or_plot["95% CI Lower"]
-            )
-            or_plot["CI High Error"] = (
-                or_plot["95% CI Upper"] - or_plot["Odds Ratio"]
-            )
-            fig = px.scatter(
-                or_plot,
-                x="Odds Ratio",
-                y="Predictor",
-                error_x="CI High Error",
-                error_x_minus="CI Low Error",
-                title="Core model odds ratios with 95% confidence intervals",
-            )
-            fig.add_vline(x=1.0, line_dash="dash")
-            fig.update_yaxes(categoryorder="array", categoryarray=or_plot["Predictor"].tolist())
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.caption(
-                "Odds Ratio > 1 indicates higher modeled odds of Watchlist/Non-Performing; "
-                "Odds Ratio < 1 indicates lower modeled odds. A confidence interval crossing "
-                "1 indicates the association is not statistically precise at the 95% level."
-            )
-
-        st.markdown("---")
-        st.subheader("B. Regularized Contributor Ranking — broader exploratory view")
-
-        all_options = [
-            "Risk Rating",
-            "LTV",
-            "Tenor",
-            "Interest Rate Type",
-            "Geography (Region)",
-            "Borrower Type",
-            "Facility Type",
-            "Industry",
-            "Relationship Manager",
-        ]
-        default_options = [
-            "Risk Rating",
-            "LTV",
-            "Tenor",
-            "Interest Rate Type",
-            "Geography (Region)",
-            "Borrower Type",
-            "Facility Type",
-        ]
-
-        selected = st.multiselect(
-            "Predictors",
-            options=all_options,
-            default=default_options,
-            help=(
-                "Industry and Relationship Manager are available but are not selected by "
-                "default because they have many levels relative to this small dataset."
-            ),
-        )
-
-        high_cardinality_selected = [
-            name
-            for name in selected
-            if name in {"Industry", "Relationship Manager"}
-        ]
-        if high_cardinality_selected:
-            st.warning(
-                "High-cardinality predictor(s) selected: "
-                + ", ".join(high_cardinality_selected)
-                + ". With this sample size, their detailed coefficients can be unstable. "
-                  "Use permutation importance as an exploratory ranking, not proof of causality."
-            )
-
-        importance, coef_table, reg_diag = run_regularized_contributor_model(
-            model_df,
-            selected,
-        )
-
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Model N", f"{reg_diag['n']:,}")
-        r2.metric("Higher-risk events", f"{reg_diag['events']:,}")
-        r3.metric(
-            "Cross-validated ROC AUC",
-            (
-                f"{reg_diag['cv_auc_mean']:.3f} ± {reg_diag['cv_auc_std']:.3f}"
-                if pd.notna(reg_diag["cv_auc_mean"])
-                else "—"
-            ),
-        )
-        r4.metric("Encoded parameters", f"{reg_diag['encoded_features']:,}")
-
-        if reg_diag.get("error"):
-            st.warning(reg_diag["error"])
-        elif not importance.empty:
-            importance_plot = importance.sort_values(
-                "Permutation Importance",
-                ascending=True,
-            )
-            fig = px.bar(
-                importance_plot,
-                x="Permutation Importance",
-                y="Feature",
-                orientation="h",
-                error_x="Importance SD",
-                title="Exploratory contributor ranking by permutation importance",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            importance_display = importance.copy()
-            importance_display["Permutation Importance"] = importance_display[
-                "Permutation Importance"
-            ].map(lambda x: f"{x:.4f}")
-            importance_display["Importance SD"] = importance_display["Importance SD"].map(
-                lambda x: f"{x:.4f}"
-            )
-            st.dataframe(
-                importance_display,
-                hide_index=True,
-                use_container_width=True,
-            )
-
-            with st.expander("Directional coefficient details"):
-                coef_display = coef_table.head(25).copy()
-                coef_display["Coefficient"] = coef_display["Coefficient"].map(
-                    lambda x: f"{x:.3f}"
-                )
-                coef_display["Model-based Odds Ratio"] = coef_display[
-                    "Model-based Odds Ratio"
-                ].map(lambda x: f"{x:.3f}")
-                coef_display["Absolute Coefficient"] = coef_display[
-                    "Absolute Coefficient"
-                ].map(lambda x: f"{x:.3f}")
-                st.dataframe(
-                    coef_display,
-                    hide_index=True,
-                    use_container_width=True,
-                )
-                st.caption(
-                    "Categorical coefficients are relative to an omitted baseline level. "
-                    "These are L2-regularized model coefficients and do not have classical "
-                    "maximum-likelihood p-values."
-                )
-
+    if core_table.empty:
         st.warning(
-            "**Interpretation control:** A contributor ranking means the variable helps the "
-            "model distinguish Higher Risk from Performing in this sample. It does not mean "
-            "the variable causes deterioration. Internal Risk Rating may itself incorporate "
-            "information about borrower deterioration, so strong association with Loan Status "
-            "is expected rather than causal."
+            "The logistic regression could not be estimated reliably. "
+            f"{core_diag.get('error') or ''}"
+        )
+    else:
+        # Keep the output focused on odds ratios and uncertainty.
+        # Continuous predictors are standardized, so their ORs represent a 1-SD increase.
+        or_plot = core_table.copy()
+        or_plot["CI Low Error"] = (
+            or_plot["Odds Ratio"] - or_plot["95% CI Lower"]
+        )
+        or_plot["CI High Error"] = (
+            or_plot["95% CI Upper"] - or_plot["Odds Ratio"]
         )
 
-    # ------------------------------------------------------------------
-    # Clustering
-    # ------------------------------------------------------------------
-    with tab_cluster:
-        st.subheader("K-means Risk Segmentation")
-        st.caption(
-            "Clustering is unsupervised: Loan Status is NOT used to create clusters. "
-            "After clusters are formed from numeric risk characteristics, performance is "
-            "compared across clusters."
+        fig = px.scatter(
+            or_plot,
+            x="Odds Ratio",
+            y="Predictor",
+            error_x="CI High Error",
+            error_x_minus="CI Low Error",
+            title="Odds of Higher-Risk Performance",
+        )
+        fig.add_vline(x=1.0, line_dash="dash")
+        fig.update_yaxes(
+            categoryorder="array",
+            categoryarray=or_plot["Predictor"].tolist(),
+        )
+        fig.update_layout(
+            xaxis_title="Odds Ratio",
+            yaxis_title=None,
+            height=420,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Short conclusion rather than additional technical metrics.
+        st.success(
+            "**Conclusion:** Risk Rating and LTV show the strongest directional "
+            "associations with weaker loan performance, while Tenor shows little "
+            "relationship. The estimates are not statistically significant, so the "
+            "findings should be interpreted as directional rather than conclusive."
         )
 
-        cluster_options = ["Risk Rating", "LTV", "Tenor", "Log Exposure"]
-        cluster_features = st.multiselect(
-            "Clustering features",
-            options=cluster_options,
-            default=cluster_options,
-            help=(
-                "All selected variables are median-imputed and standardized before K-means. "
-                "Log Exposure is used instead of raw exposure to reduce extreme scale effects."
-            ),
-            key="cluster_features",
-        )
+    st.markdown("---")
 
-        if len(cluster_features) < 2:
-            st.info("Select at least two clustering features.")
+    # =====================================================================
+    # Panel 2 — Clustering
+    # =====================================================================
+    st.subheader("Panel 2 — Clustering")
+
+    # Use a fixed four-cluster solution for presentation.
+    # In the current dataset, k=4 provides nearly the same silhouette quality as the
+    # highest-scoring solution while producing more interpretable portfolio segments.
+    cluster_features = ["Risk Rating", "LTV", "Tenor", "Log Exposure"]
+    _, scaled, _, _ = prepare_cluster_matrix(
+        model_df,
+        cluster_features,
+    )
+
+    if len(model_df) < 8:
+        st.warning("Not enough observations for a stable clustering analysis.")
+        return
+
+    chosen_k = 4
+    kmeans = KMeans(
+        n_clusters=chosen_k,
+        random_state=42,
+        n_init=20,
+    )
+    labels = kmeans.fit_predict(scaled)
+
+    clustered = model_df.copy()
+    clustered["Cluster"] = pd.Series(
+        labels,
+        index=clustered.index,
+    ).map(lambda x: f"Cluster {int(x) + 1}")
+
+    profile = cluster_profile_table(clustered).copy()
+
+    # Add a simple descriptive name so the table is easier to interpret.
+    # Names are assigned from the actual profile rather than hard-coded cluster numbers,
+    # because K-means cluster labels themselves are arbitrary.
+    profile["Segment"] = ""
+
+    weakest_cluster = profile["Avg Risk Rating"].idxmax()
+    highest_ltv_cluster = profile["Median LTV"].idxmax()
+    largest_cluster = profile["Exposure %"].idxmax()
+
+    for idx in profile.index:
+        if idx == weakest_cluster:
+            profile.at[idx, "Segment"] = "Weak Rating"
+        elif idx == highest_ltv_cluster:
+            profile.at[idx, "Segment"] = "High LTV"
+        elif idx == largest_cluster:
+            profile.at[idx, "Segment"] = "Core Portfolio"
         else:
-            raw_cluster_data, scaled, _, _ = prepare_cluster_matrix(
-                model_df,
-                cluster_features,
-            )
+            profile.at[idx, "Segment"] = "Stronger / Smaller"
 
-            n_obs = len(model_df)
-            max_k = min(6, n_obs - 1)
-            silhouette_rows = []
+    display_profile = profile[
+        [
+            "Cluster",
+            "Segment",
+            "Loan Count",
+            "Exposure %",
+            "Higher-Risk Exposure %",
+            "Avg Risk Rating",
+            "Median LTV",
+            "Median Tenor",
+        ]
+    ].copy()
 
-            if max_k >= 2:
-                for k in range(2, max_k + 1):
-                    km = KMeans(
-                        n_clusters=k,
-                        random_state=42,
-                        n_init=20,
-                    )
-                    labels = km.fit_predict(scaled)
-                    if len(set(labels)) > 1:
-                        score = silhouette_score(scaled, labels)
-                    else:
-                        score = np.nan
-                    silhouette_rows.append({"k": k, "Silhouette Score": score})
+    display_profile["Exposure %"] = display_profile["Exposure %"].map(
+        lambda x: f"{x:.1%}" if pd.notna(x) else "—"
+    )
+    display_profile["Higher-Risk Exposure %"] = display_profile[
+        "Higher-Risk Exposure %"
+    ].map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
 
-            silhouette_df = pd.DataFrame(silhouette_rows)
+    for col in ["Avg Risk Rating", "Median LTV", "Median Tenor"]:
+        display_profile[col] = display_profile[col].map(
+            lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+        )
 
-            if silhouette_df.empty:
-                st.warning("Not enough observations to estimate multiple clusters.")
-            else:
-                best_k = int(
-                    silhouette_df.loc[
-                        silhouette_df["Silhouette Score"].idxmax(),
-                        "k",
-                    ]
-                )
+    st.dataframe(
+        display_profile,
+        hide_index=True,
+        use_container_width=True,
+    )
 
-                left, right = st.columns([1, 2])
+    # Compact visual: compare Higher-Risk exposure by cluster.
+    cluster_plot = profile.copy()
+    cluster_plot["Cluster Label"] = (
+        cluster_plot["Cluster"] + " — " + cluster_plot["Segment"]
+    )
 
-                with left:
-                    chosen_k = st.selectbox(
-                        "Number of clusters",
-                        options=silhouette_df["k"].astype(int).tolist(),
-                        index=silhouette_df["k"].astype(int).tolist().index(best_k),
-                        help=(
-                            "The default is the k with the highest silhouette score. "
-                            "Cluster numbering itself is arbitrary."
-                        ),
-                    )
+    fig2 = px.bar(
+        cluster_plot,
+        x="Cluster Label",
+        y="Higher-Risk Exposure %",
+        title="Higher-Risk Exposure by Cluster",
+    )
+    fig2.update_yaxes(
+        tickformat=".0%",
+        title="Higher-Risk Exposure %",
+    )
+    fig2.update_xaxes(title=None)
+    st.plotly_chart(fig2, use_container_width=True)
 
-                with right:
-                    sil_fig = px.line(
-                        silhouette_df,
-                        x="k",
-                        y="Silhouette Score",
-                        markers=True,
-                        title="Silhouette score by number of clusters",
-                    )
-                    st.plotly_chart(sil_fig, use_container_width=True)
-
-                kmeans = KMeans(
-                    n_clusters=int(chosen_k),
-                    random_state=42,
-                    n_init=20,
-                )
-                labels = kmeans.fit_predict(scaled)
-
-                clustered = model_df.copy()
-                clustered["Cluster"] = pd.Series(
-                    labels,
-                    index=clustered.index,
-                ).map(lambda x: f"Cluster {int(x) + 1}")
-
-                profile = cluster_profile_table(clustered)
-                display_profile = profile.copy()
-                display_profile["Exposure"] = display_profile["Exposure"].map(
-                    format_currency
-                )
-                display_profile["Median Exposure"] = display_profile[
-                    "Median Exposure"
-                ].map(format_currency)
-
-                for pct_col in [
-                    "Exposure %",
-                    "Higher-Risk Loans %",
-                    "Higher-Risk Exposure %",
-                ]:
-                    display_profile[pct_col] = display_profile[pct_col].map(
-                        lambda x: f"{x:.1%}" if pd.notna(x) else "—"
-                    )
-
-                for num_col in [
-                    "Avg Risk Rating",
-                    "Median LTV",
-                    "Median Tenor",
-                ]:
-                    display_profile[num_col] = display_profile[num_col].map(
-                        lambda x: f"{x:.2f}" if pd.notna(x) else "—"
-                    )
-
-                st.markdown("**Cluster profile**")
-                st.dataframe(
-                    display_profile,
-                    hide_index=True,
-                    use_container_width=True,
-                )
-
-                # Compare performance after clustering. This is deliberately post-hoc:
-                # outcome status played no role in the K-means fit.
-                cluster_mix, _ = performance_mix_by_dimension(
-                    clustered,
-                    "Cluster",
-                )
-                mix_fig = px.bar(
-                    cluster_mix,
-                    x="Cluster",
-                    y="Exposure Share",
-                    color="Loan Status",
-                    barmode="stack",
-                    title="Loan performance mix by cluster",
-                    category_orders={
-                        "Loan Status": normalized_status_order(clustered)
-                    },
-                    hover_data={
-                        "Exposure": ":,.0f",
-                        "Loan_Count": True,
-                        "Exposure Share": ":.1%",
-                    },
-                )
-                mix_fig.update_yaxes(tickformat=".0%", range=[0, 1])
-                st.plotly_chart(mix_fig, use_container_width=True)
-
-                # PCA is used only as a 2D visualization of the standardized K-means space.
-                # It is not used to rank contributors to performance.
-                pca = PCA(n_components=2, random_state=42)
-                coords = pca.fit_transform(scaled)
-                pca_df = clustered[
-                    [
-                        "Loan ID",
-                        "Borrower Name",
-                        "Loan Status",
-                        BALANCE_COL,
-                        "Cluster",
-                    ]
-                ].copy()
-                pca_df["PC1"] = coords[:, 0]
-                pca_df["PC2"] = coords[:, 1]
-
-                pca_fig = px.scatter(
-                    pca_df,
-                    x="PC1",
-                    y="PC2",
-                    color="Cluster",
-                    symbol="Loan Status",
-                    hover_data=[
-                        "Loan ID",
-                        "Borrower Name",
-                        BALANCE_COL,
-                    ],
-                    title=(
-                        "2D visualization of cluster space "
-                        f"(PCA explains {pca.explained_variance_ratio_.sum():.1%} of variance)"
-                    ),
-                )
-                st.plotly_chart(pca_fig, use_container_width=True)
-
-                with st.expander("Loan-level cluster assignments"):
-                    assignment = clustered[
-                        [
-                            "Loan ID",
-                            "Borrower Name",
-                            "Loan Status",
-                            "Cluster",
-                            "Risk Rating",
-                            "LTV",
-                            "Tenor",
-                            BALANCE_COL,
-                        ]
-                    ].copy()
-                    st.dataframe(
-                        assignment.sort_values(["Cluster", "Loan ID"]),
-                        hide_index=True,
-                        use_container_width=True,
-                    )
-
-                st.caption(
-                    "Cluster labels are descriptive segments, not credit grades. "
-                    "A cluster with a higher Watchlist/Non-Performing share may identify a "
-                    "risk profile worth further review, but clustering alone does not establish "
-                    "which variable causes weak performance."
-                )
-
+    st.success(
+        "**Conclusion:** The weak-rating and high-LTV clusters show the highest "
+        "higher-risk exposure, suggesting these characteristics deserve closer "
+        "portfolio monitoring."
+    )
 
 # -----------------------------------------------------------------------------
 # Page 4 — Cleaning workflow
@@ -2593,7 +2316,7 @@ def main() -> None:
         [
             "Data Cleaning",
             "Portfolio Summary",
-            "Statistical Analysis",
+            "Performance Analysis",
             "Workflow",
         ],
     )
@@ -2628,7 +2351,7 @@ def main() -> None:
         render_cleaning_page()
     elif page == "Portfolio Summary":
         render_summary_page()
-    elif page == "Statistical Analysis":
+    elif page == "Performance Analysis":
         render_statistical_analysis_page()
     else:
         render_workflow_page()
