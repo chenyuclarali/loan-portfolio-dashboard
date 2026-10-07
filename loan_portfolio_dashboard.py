@@ -2114,145 +2114,146 @@ def render_workflow_page() -> None:
         rankdir=TB;
         graph [
             bgcolor="transparent",
-            pad="0.05",
-            nodesep="0.10",
-            ranksep="0.18",
+            pad="0.02",
+            nodesep="0.05",
+            ranksep="0.09",
             splines=ortho
         ];
         node [
             shape=box,
             style="rounded,filled",
             fontname="Arial",
-            fontsize=7,
-            margin="0.07,0.04",
+            fontsize=5,
+            margin="0.03,0.02",
             color="#7A7A7A",
-            fillcolor="#F7F7F7"
+            fillcolor="#F7F7F7",
+            penwidth=0.6
         ];
         edge [
             fontname="Arial",
-            fontsize=8,
+            fontsize=5,
             color="#6B7280",
-            arrowsize=0.50
+            arrowsize=0.35
         ];
 
         upload [
-            label="Upload Excel\nLoan_Portfolio_Data",
+            label="Upload Excel\nLoan Portfolio\nData",
             fillcolor="#E8F1FB",
             color="#4C78A8"
         ];
 
         validate [
-            label="Validate schema & record count\nRequired columns / expected rows",
+            label="Validate schema\n& record count",
             fillcolor="#E8F1FB",
             color="#4C78A8"
         ];
 
         text [
-            label="1. Clean text fields\nTrim whitespace / normalize spacing",
+            label="1. Clean text\nTrim / normalize spacing",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         category [
-            label="2. Standardize known categories\nUSA → United States\nPerfroming → Performing",
+            label="2. Standardize\nknown categories",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         balance [
-            label="3. Clean outstanding balance\nNumeric conversion\nNegative balance assumption + flag",
+            label="3. Balance\nConvert / flag negatives",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         rate [
-            label="4. Validate rate fields\nFixed vs Floating logic\n525bps → 5.25%",
+            label="4. Rate fields\nFixed / Floating checks",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         rating [
-            label="5. Validate risk rating\nOnly 1–10 accepted\nInvalid → missing + flag",
+            label="5. Risk rating\nValidate 1–10",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         dates [
-            label="6. Validate dates & tenor\nParse dates / implied tenor\nDo not guess invalid dates",
+            label="6. Dates & tenor\nValidate / derive",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         ltv [
-            label="7. Validate LTV\nNegative retained + review flag\n>100% retained + review flag",
+            label="7. LTV\nRetain + flag anomalies",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         duplicate [
-            label="8. Duplicate checks\nDuplicate Loan ID\nPotential duplicate facility",
+            label="8. Duplicates\nID / facility checks",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         outlier [
-            label="9. Exposure outlier check\n3×IQR = Q3 + 3×(Q3−Q1)\nReview flag; no automatic deletion",
+            label="9. Exposure outlier\n3×IQR flag only",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         fuzzy [
-            label="10. RapidFuzz secondary QA\nPossible text / borrower-name anomalies\nFLAG ONLY — no overwrite",
+            label="10. RapidFuzz QA\nFlag only",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         decision [
-            label="Manual Review Required?",
+            label="Manual Review\nRequired?",
             shape=diamond,
             fillcolor="#F3E8FF",
             color="#8B5FBF"
         ];
 
         auto_include [
-            label="NO\nInclude in Analysis = TRUE\nautomatically",
+            label="NO\nInclude = TRUE",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         manual [
-            label="YES\nDefault Include in Analysis = FALSE\nReviewer edits / verifies record",
+            label="YES\nInclude = FALSE\nManual review",
             fillcolor="#FDECEC",
             color="#C75B5B"
         ];
 
         recheck [
-            label="Rerun validation rules\nUpdate review flags & audit trail\nPreserve manual inclusion choice",
+            label="Rerun validation\nPreserve inclusion choice",
             fillcolor="#FDECEC",
             color="#C75B5B"
         ];
 
         include_decision [
-            label="Include in Analysis?",
+            label="Include in\nAnalysis?",
             shape=diamond,
             fillcolor="#F3E8FF",
             color="#8B5FBF"
         ];
 
         final [
-            label="TRUE\nIncluded in Portfolio Summary",
+            label="TRUE\nPortfolio Summary",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         excluded [
-            label="FALSE\nRetained in Cleaned_Data\nExcluded from Portfolio Summary",
+            label="FALSE\nRetain / exclude\nfrom summary",
             fillcolor="#FDECEC",
             color="#C75B5B"
         ];
 
         outputs [
-            label="Outputs\nCleaned_Data\nAnalysis Included / Excluded\nValidation Log\nDownload Excel",
+            label="Outputs\nCleaned data / logs\nDownload Excel",
             fillcolor="#E8F1FB",
             color="#4C78A8"
         ];
@@ -2286,7 +2287,7 @@ def render_workflow_page() -> None:
     """
 
     # Keep the workflow visually compact on wide screens.
-    _, workflow_col, _ = st.columns([0.15, 0.70, 0.15])
+    _, workflow_col, _ = st.columns([0.325, 0.35, 0.325])
     with workflow_col:
         st.graphviz_chart(workflow_dot, use_container_width=True)
 
