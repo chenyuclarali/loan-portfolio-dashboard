@@ -584,9 +584,10 @@ def clean_and_validate_ltv(
     """
     Convert LTV to numeric.
 
-    Negative LTV is treated as invalid because it is not economically meaningful under
-    the usual loan-to-value definition and is therefore set to missing pending review.
-    LTV above 100% is retained because it can be economically real (for example after
+    Negative LTV is unusual under the standard loan-to-value definition, but the script
+    does not infer the correct value or sign.  The source value is therefore retained and
+    flagged for manual/source-system review rather than being overwritten or set to missing.
+    LTV above 100% is also retained because it can be economically real (for example after
     collateral deterioration or an over-advance).  High LTV is therefore a review flag,
     not an automatic correction or cap at 100%.
     """
@@ -598,16 +599,20 @@ def clean_and_validate_ltv(
     negative_ltv = df[col] < 0
     for idx in df.index[negative_ltv]:
         original = df.at[idx, col]
-        df.at[idx, col] = np.nan
 
+        # Do not infer a corrected sign/value. A negative source LTV may reflect a data-entry,
+        # denominator, collateral, or source-system issue that requires human confirmation.
         add_issue(
             issues,
             issue_type="LTV",
-            description="Negative LTV is not economically meaningful.",
-            action="Set to missing; verify collateral and exposure values.",
+            description="Negative LTV requires source-system verification.",
+            action=(
+                "Retained the source value unchanged; manual review required before deciding "
+                "whether the LTV should be corrected or included in analysis."
+            ),
             loan_id=df.at[idx, "Loan ID"],
             original_value=original,
-            cleaned_value=np.nan,
+            cleaned_value=original,
         )
 
     high_ltv = df[col] > 100

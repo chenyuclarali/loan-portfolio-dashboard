@@ -1999,7 +1999,7 @@ def render_statistical_analysis_page() -> None:
         elif idx == largest_cluster:
             profile.at[idx, "Segment"] = "Core Portfolio"
         else:
-            profile.at[idx, "Segment"] = "Stronger / Smaller"
+            profile.at[idx, "Segment"] = "Lower-Risk / Smaller Exposure"
 
     display_profile = profile[
         [
@@ -2114,25 +2114,25 @@ def render_workflow_page() -> None:
         rankdir=TB;
         graph [
             bgcolor="transparent",
-            pad="0.25",
-            nodesep="0.30",
-            ranksep="0.42",
+            pad="0.10",
+            nodesep="0.18",
+            ranksep="0.28",
             splines=ortho
         ];
         node [
             shape=box,
             style="rounded,filled",
             fontname="Arial",
-            fontsize=11,
-            margin="0.16,0.10",
+            fontsize=9,
+            margin="0.10,0.06",
             color="#7A7A7A",
             fillcolor="#F7F7F7"
         ];
         edge [
             fontname="Arial",
-            fontsize=10,
+            fontsize=8,
             color="#6B7280",
-            arrowsize=0.75
+            arrowsize=0.60
         ];
 
         upload [
