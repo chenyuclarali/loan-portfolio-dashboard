@@ -10,8 +10,9 @@ https://loan-portfolio-dashboard.streamlit.app/
   4. Click Download Full Results Excel to export the current analysis.
   5. Results update based on the current Include in Analysis selections.
 
-Sidebar navigation
+Python Instructions
 ------------------
+Sidebar navigation
 Case Study
   - Data Cleaning
   - Portfolio Summary
@@ -29,7 +30,6 @@ Run the dashboard:
   python -m streamlit run loan_portfolio_dashboard_with_workflow.py
 
 Data Cleaning
--------------
 - Upload the raw case-study Excel workbook.
 - Select Loan_Portfolio_Data.
 - Run automated cleaning.
@@ -40,7 +40,6 @@ Data Cleaning
 - Download the current cleaned workbook.
 
 Portfolio Summary
------------------
 - Portfolio composition by geography, industry, borrower type, and facility type.
 - Fixed vs. floating exposure.
 - Risk rating and loan-status distributions.
@@ -48,7 +47,6 @@ Portfolio Summary
 - Assumptions and data-treatment table.
 
 Workflow
---------
 - Interactive workflow chart showing the full cleaning process.
 - Green nodes = deterministic corrections.
 - Orange nodes = validation / flag-only checks.
