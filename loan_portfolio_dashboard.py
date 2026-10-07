@@ -2114,146 +2114,145 @@ def render_workflow_page() -> None:
         rankdir=TB;
         graph [
             bgcolor="transparent",
-            pad="0.02",
-            nodesep="0.05",
-            ranksep="0.09",
+            pad="0.25",
+            nodesep="0.30",
+            ranksep="0.42",
             splines=ortho
         ];
         node [
             shape=box,
             style="rounded,filled",
             fontname="Arial",
-            fontsize=5,
-            margin="0.03,0.02",
+            fontsize=11,
+            margin="0.16,0.10",
             color="#7A7A7A",
-            fillcolor="#F7F7F7",
-            penwidth=0.6
+            fillcolor="#F7F7F7"
         ];
         edge [
             fontname="Arial",
-            fontsize=5,
+            fontsize=10,
             color="#6B7280",
-            arrowsize=0.35
+            arrowsize=0.75
         ];
 
         upload [
-            label="Upload Excel\nLoan Portfolio\nData",
+            label="Upload Excel\nLoan_Portfolio_Data",
             fillcolor="#E8F1FB",
             color="#4C78A8"
         ];
 
         validate [
-            label="Validate schema\n& record count",
+            label="Validate schema & record count\nRequired columns / expected rows",
             fillcolor="#E8F1FB",
             color="#4C78A8"
         ];
 
         text [
-            label="1. Clean text\nTrim / normalize spacing",
+            label="1. Clean text fields\nTrim whitespace / normalize spacing",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         category [
-            label="2. Standardize\nknown categories",
+            label="2. Standardize known categories\nUSA → United States\nPerfroming → Performing",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         balance [
-            label="3. Balance\nConvert / flag negatives",
+            label="3. Clean outstanding balance\nNumeric conversion\nNegative balance assumption + flag",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         rate [
-            label="4. Rate fields\nFixed / Floating checks",
+            label="4. Validate rate fields\nFixed vs Floating logic\n525bps → 5.25%",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         rating [
-            label="5. Risk rating\nValidate 1–10",
+            label="5. Validate risk rating\nOnly 1–10 accepted\nInvalid → missing + flag",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         dates [
-            label="6. Dates & tenor\nValidate / derive",
+            label="6. Validate dates & tenor\nParse dates / implied tenor\nDo not guess invalid dates",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         ltv [
-            label="7. LTV\nRetain + flag anomalies",
+            label="7. Validate LTV\nNegative retained + review flag\n>100% retained + review flag",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         duplicate [
-            label="8. Duplicates\nID / facility checks",
+            label="8. Duplicate checks\nDuplicate Loan ID\nPotential duplicate facility",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         outlier [
-            label="9. Exposure outlier\n3×IQR flag only",
+            label="9. Exposure outlier check\n3×IQR = Q3 + 3×(Q3−Q1)\nReview flag; no automatic deletion",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         fuzzy [
-            label="10. RapidFuzz QA\nFlag only",
+            label="10. RapidFuzz secondary QA\nPossible text / borrower-name anomalies\nFLAG ONLY — no overwrite",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
 
         decision [
-            label="Manual Review\nRequired?",
+            label="Manual Review Required?",
             shape=diamond,
             fillcolor="#F3E8FF",
             color="#8B5FBF"
         ];
 
         auto_include [
-            label="NO\nInclude = TRUE",
+            label="NO\nInclude in Analysis = TRUE\nautomatically",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         manual [
-            label="YES\nInclude = FALSE\nManual review",
+            label="YES\nDefault Include in Analysis = FALSE\nReviewer edits / verifies record",
             fillcolor="#FDECEC",
             color="#C75B5B"
         ];
 
         recheck [
-            label="Rerun validation\nPreserve inclusion choice",
+            label="Rerun validation rules\nUpdate review flags & audit trail\nPreserve manual inclusion choice",
             fillcolor="#FDECEC",
             color="#C75B5B"
         ];
 
         include_decision [
-            label="Include in\nAnalysis?",
+            label="Include in Analysis?",
             shape=diamond,
             fillcolor="#F3E8FF",
             color="#8B5FBF"
         ];
 
         final [
-            label="TRUE\nPortfolio Summary",
+            label="TRUE\nIncluded in Portfolio Summary",
             fillcolor="#EAF6EC",
             color="#4E9A5F"
         ];
 
         excluded [
-            label="FALSE\nRetain / exclude\nfrom summary",
+            label="FALSE\nRetained in Cleaned_Data\nExcluded from Portfolio Summary",
             fillcolor="#FDECEC",
             color="#C75B5B"
         ];
 
         outputs [
-            label="Outputs\nCleaned data / logs\nDownload Excel",
+            label="Outputs\nCleaned_Data\nAnalysis Included / Excluded\nValidation Log\nDownload Excel",
             fillcolor="#E8F1FB",
             color="#4C78A8"
         ];
@@ -2286,10 +2285,7 @@ def render_workflow_page() -> None:
     }
     """
 
-    # Keep the workflow visually compact on wide screens.
-    _, workflow_col, _ = st.columns([0.325, 0.35, 0.325])
-    with workflow_col:
-        st.graphviz_chart(workflow_dot, use_container_width=True)
+    st.graphviz_chart(workflow_dot, use_container_width=True)
 
     st.markdown("### Workflow logic")
     logic_df = pd.DataFrame(
