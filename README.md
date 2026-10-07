@@ -1,4 +1,4 @@
-# Loan Portfolio Dashboard v5
+# Loan Portfolio Dashboard
 
 Pages:
 1. Data Cleaning
