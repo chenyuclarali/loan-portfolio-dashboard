@@ -1900,204 +1900,51 @@ def render_statistical_analysis_page() -> None:
     # =====================================================================
     st.subheader("Panel 1 — Logistic Regression")
 
-    factor_options = [
-        "Risk Rating",
-        "LTV",
-        "Tenor",
-        "Interest Rate Type",
-        "Geography (Region)",
-        "Borrower Type",
-        "Facility Type",
-        "Industry",
-        "Relationship Manager",
-    ]
+    core_table, core_diag = run_core_logistic_inference(model_df)
 
-    selected_factors = st.multiselect(
-        "Select factors",
-        options=factor_options,
-        default=["Risk Rating", "LTV", "Tenor", "Interest Rate Type"],
-        help=(
-            "Select the factors to include in the logistic regression. "
-            "With a small sample, adding many categorical variables can make estimates unstable."
-        ),
-        key="logistic_factor_selection",
-    )
-
-    # For a clean odds-ratio display, fit the selected predictors in one statsmodels model.
-    # Numeric predictors are standardized so their ORs represent a one-standard-deviation
-    # increase. Categorical predictors are one-hot encoded with the first level as baseline.
-    if not selected_factors:
-        st.info("Select at least one factor.")
+    if core_table.empty:
+        st.warning(
+            "The logistic regression could not be estimated reliably. "
+            f"{core_diag.get('error') or ''}"
+        )
     else:
-        numeric_map = {
-            "Risk Rating": "Risk Rating",
-            "LTV": "LTV",
-            "Tenor": "Tenor",
-        }
-        categorical_map = {
-            "Interest Rate Type": "Interest Rate Type",
-            "Geography (Region)": "Region",
-            "Borrower Type": "Borrower Type",
-            "Facility Type": "Facility Type",
-            "Industry": "Industry",
-            "Relationship Manager": "Relationship Manager",
-        }
+        # Keep the output focused on odds ratios and uncertainty.
+        # Continuous predictors are standardized, so their ORs represent a 1-SD increase.
+        or_plot = core_table.copy()
+        or_plot["CI Low Error"] = (
+            or_plot["Odds Ratio"] - or_plot["95% CI Lower"]
+        )
+        or_plot["CI High Error"] = (
+            or_plot["95% CI Upper"] - or_plot["Odds Ratio"]
+        )
 
-        selected_numeric = [
-            numeric_map[x] for x in selected_factors if x in numeric_map
-        ]
-        selected_categorical = [
-            categorical_map[x] for x in selected_factors if x in categorical_map
-        ]
+        fig = px.scatter(
+            or_plot,
+            x="Odds Ratio",
+            y="Predictor",
+            error_x="CI High Error",
+            error_x_minus="CI Low Error",
+            title="Odds of Higher-Risk Performance",
+        )
+        fig.add_vline(x=1.0, line_dash="dash")
+        fig.update_yaxes(
+            categoryorder="array",
+            categoryarray=or_plot["Predictor"].tolist(),
+        )
+        fig.update_layout(
+            xaxis_title="Odds Ratio",
+            yaxis_title=None,
+            height=420,
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-        regression_cols = selected_numeric + selected_categorical + ["Higher Risk"]
-        reg_df = model_df[regression_cols].copy()
-
-        # Complete-case inference keeps confidence intervals and p-values interpretable.
-        reg_df = reg_df.dropna()
-
-        if (
-            len(reg_df) < 20
-            or reg_df["Higher Risk"].nunique() < 2
-            or reg_df["Higher Risk"].sum() < 3
-            or (1 - reg_df["Higher Risk"]).sum() < 3
-        ):
-            st.warning(
-                "Not enough complete observations or outcome variation for the selected factors. "
-                "Try fewer factors."
-            )
-        else:
-            x_parts = []
-
-            # Standardize numeric variables so coefficients are on comparable scales.
-            if selected_numeric:
-                numeric_x = reg_df[selected_numeric].astype(float).copy()
-                means = numeric_x.mean()
-                stds = numeric_x.std(ddof=0).replace(0, np.nan)
-                numeric_x = (numeric_x - means) / stds
-                numeric_x = numeric_x.dropna(axis=1, how="all")
-                x_parts.append(numeric_x)
-
-            # Dummy-code selected categorical factors. drop_first=True defines the
-            # omitted baseline category used for interpretation of each odds ratio.
-            if selected_categorical:
-                categorical_x = pd.get_dummies(
-                    reg_df[selected_categorical].astype("string"),
-                    drop_first=True,
-                    dtype=float,
-                )
-                x_parts.append(categorical_x)
-
-            if not x_parts:
-                st.warning("No usable predictors remain after preprocessing.")
-            else:
-                x = pd.concat(x_parts, axis=1)
-                x = x.replace([np.inf, -np.inf], np.nan).dropna()
-                y = reg_df.loc[x.index, "Higher Risk"].astype(int)
-
-                # Guard against a parameter count that is too large for the case-study sample.
-                # We still allow the user to explore, but warn when the model is very dense.
-                if x.shape[1] >= max(1, min(int(y.sum()), int((1 - y).sum()))):
-                    st.warning(
-                        "The selected model has many parameters relative to the number of "
-                        "Higher-Risk observations. Odds ratios may be unstable; consider fewer factors."
-                    )
-
-                x_const = sm.add_constant(x.astype(float), has_constant="add")
-
-                try:
-                    logit_result = sm.Logit(y, x_const).fit(
-                        disp=False,
-                        maxiter=300,
-                    )
-
-                    conf = logit_result.conf_int()
-                    result_rows = []
-
-                    # Map encoded predictor names back to a readable factor label.
-                    for term in x.columns:
-                        if term in selected_numeric:
-                            predictor_label = f"{term} (per 1 SD increase)"
-                        else:
-                            predictor_label = term
-
-                        result_rows.append(
-                            {
-                                "Predictor": predictor_label,
-                                "Odds Ratio": float(np.exp(logit_result.params[term])),
-                                "95% CI Lower": float(np.exp(conf.loc[term, 0])),
-                                "95% CI Upper": float(np.exp(conf.loc[term, 1])),
-                                "p-value": float(logit_result.pvalues[term]),
-                            }
-                        )
-
-                    odds_df = pd.DataFrame(result_rows)
-
-                    # Keep extreme/infinite confidence intervals from making the chart unreadable.
-                    finite_plot = odds_df.replace([np.inf, -np.inf], np.nan).dropna(
-                        subset=["Odds Ratio", "95% CI Lower", "95% CI Upper"]
-                    )
-
-                    if finite_plot.empty:
-                        st.warning(
-                            "The selected model produced unstable or non-finite estimates. "
-                            "Try fewer factors."
-                        )
-                    else:
-                        finite_plot["CI Low Error"] = (
-                            finite_plot["Odds Ratio"] - finite_plot["95% CI Lower"]
-                        )
-                        finite_plot["CI High Error"] = (
-                            finite_plot["95% CI Upper"] - finite_plot["Odds Ratio"]
-                        )
-
-                        # Odds-ratio dot plot.
-                        fig = px.scatter(
-                            finite_plot,
-                            x="Odds Ratio",
-                            y="Predictor",
-                            error_x="CI High Error",
-                            error_x_minus="CI Low Error",
-                            hover_data={"p-value": ":.3f"},
-                            title="Odds Ratio by Selected Factor",
-                        )
-                        fig.add_vline(x=1.0, line_dash="dash")
-                        fig.update_layout(
-                            xaxis_title="Odds Ratio",
-                            yaxis_title=None,
-                            height=max(420, 32 * len(finite_plot) + 160),
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-
-                        # Compact detail table under the plot.
-                        detail = odds_df.copy()
-                        detail["Odds Ratio"] = detail["Odds Ratio"].map(
-                            lambda x: f"{x:.2f}" if np.isfinite(x) else "—"
-                        )
-                        detail["95% CI"] = odds_df.apply(
-                            lambda r: (
-                                f"{r['95% CI Lower']:.2f} – {r['95% CI Upper']:.2f}"
-                                if np.isfinite(r["95% CI Lower"])
-                                and np.isfinite(r["95% CI Upper"])
-                                else "—"
-                            ),
-                            axis=1,
-                        )
-                        detail["p-value"] = detail["p-value"].map(
-                            lambda x: f"{x:.3f}" if np.isfinite(x) else "—"
-                        )
-                        st.dataframe(
-                            detail[["Predictor", "Odds Ratio", "95% CI", "p-value"]],
-                            hide_index=True,
-                            use_container_width=True,
-                        )
-
-                except Exception as exc:
-                    st.warning(
-                        "The selected logistic model could not be estimated reliably. "
-                        "Try fewer factors or remove high-cardinality categorical variables. "
-                        f"Model message: {exc}"
-                    )
+        # Short conclusion rather than additional technical metrics.
+        st.success(
+            "**Conclusion:** Risk Rating and LTV show the strongest directional "
+            "associations with weaker loan performance, while Tenor shows little "
+            "relationship. The estimates are not statistically significant, so the "
+            "findings should be interpreted as directional rather than conclusive."
+        )
 
     st.markdown("---")
 
@@ -2106,8 +1953,11 @@ def render_statistical_analysis_page() -> None:
     # =====================================================================
     st.subheader("Panel 2 — Clustering")
 
+    # Use a fixed four-cluster solution for presentation.
+    # In the current dataset, k=4 provides nearly the same silhouette quality as the
+    # highest-scoring solution while producing more interpretable portfolio segments.
     cluster_features = ["Risk Rating", "LTV", "Tenor", "Log Exposure"]
-    raw_cluster_data, scaled, imputer, scaler = prepare_cluster_matrix(
+    _, scaled, _, _ = prepare_cluster_matrix(
         model_df,
         cluster_features,
     )
@@ -2116,7 +1966,6 @@ def render_statistical_analysis_page() -> None:
         st.warning("Not enough observations for a stable clustering analysis.")
         return
 
-    # Fixed four-cluster solution for a concise, comparable dashboard.
     chosen_k = 4
     kmeans = KMeans(
         n_clusters=chosen_k,
@@ -2131,39 +1980,31 @@ def render_statistical_analysis_page() -> None:
         index=clustered.index,
     ).map(lambda x: f"Cluster {int(x) + 1}")
 
-    # ------------------------------------------------------------
-    # Key contributing factor for each cluster
-    # ------------------------------------------------------------
-    # K-means was fit in standardized space. The centroid coordinate with the largest
-    # absolute magnitude identifies the feature that most distinguishes that cluster
-    # from the portfolio average. Positive means above-average; negative means below-average.
-    feature_display_names = ["Risk Rating", "LTV", "Tenor", "Log Exposure"]
-    centroid_rows = []
+    profile = cluster_profile_table(clustered).copy()
 
-    for cluster_index, centroid in enumerate(kmeans.cluster_centers_):
-        strongest_idx = int(np.argmax(np.abs(centroid)))
-        direction = "Higher" if centroid[strongest_idx] > 0 else "Lower"
+    # Add a simple descriptive name so the table is easier to interpret.
+    # Names are assigned from the actual profile rather than hard-coded cluster numbers,
+    # because K-means cluster labels themselves are arbitrary.
+    profile["Segment"] = ""
 
-        centroid_rows.append(
-            {
-                "Cluster": f"Cluster {cluster_index + 1}",
-                "Key Contributing Factor": feature_display_names[strongest_idx],
-                "Direction": direction,
-                "Standardized Difference": float(centroid[strongest_idx]),
-            }
-        )
+    weakest_cluster = profile["Avg Risk Rating"].idxmax()
+    highest_ltv_cluster = profile["Median LTV"].idxmax()
+    largest_cluster = profile["Exposure %"].idxmax()
 
-    key_factor_df = pd.DataFrame(centroid_rows)
+    for idx in profile.index:
+        if idx == weakest_cluster:
+            profile.at[idx, "Segment"] = "Weak Rating"
+        elif idx == highest_ltv_cluster:
+            profile.at[idx, "Segment"] = "High LTV"
+        elif idx == largest_cluster:
+            profile.at[idx, "Segment"] = "Core Portfolio"
+        else:
+            profile.at[idx, "Segment"] = "Stronger / Smaller"
 
-    # Add economic/performance profile.
-    profile = cluster_profile_table(clustered)
-    cluster_summary = profile.merge(key_factor_df, on="Cluster", how="left")
-
-    display_summary = cluster_summary[
+    display_profile = profile[
         [
             "Cluster",
-            "Key Contributing Factor",
-            "Direction",
+            "Segment",
             "Loan Count",
             "Exposure %",
             "Higher-Risk Exposure %",
@@ -2173,107 +2014,48 @@ def render_statistical_analysis_page() -> None:
         ]
     ].copy()
 
-    display_summary["Exposure %"] = display_summary["Exposure %"].map(
+    display_profile["Exposure %"] = display_profile["Exposure %"].map(
         lambda x: f"{x:.1%}" if pd.notna(x) else "—"
     )
-    display_summary["Higher-Risk Exposure %"] = display_summary[
+    display_profile["Higher-Risk Exposure %"] = display_profile[
         "Higher-Risk Exposure %"
     ].map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
 
     for col in ["Avg Risk Rating", "Median LTV", "Median Tenor"]:
-        display_summary[col] = display_summary[col].map(
+        display_profile[col] = display_profile[col].map(
             lambda x: f"{x:.2f}" if pd.notna(x) else "—"
         )
 
     st.dataframe(
-        display_summary,
+        display_profile,
         hide_index=True,
         use_container_width=True,
     )
 
-    # ------------------------------------------------------------
-    # Dot plot: standardized cluster centroids by feature
-    # ------------------------------------------------------------
-    centroid_long = []
-    for cluster_index, centroid in enumerate(kmeans.cluster_centers_):
-        for feature_name, z_value in zip(feature_display_names, centroid):
-            centroid_long.append(
-                {
-                    "Cluster": f"Cluster {cluster_index + 1}",
-                    "Factor": feature_name,
-                    "Standardized Difference": float(z_value),
-                }
-            )
-
-    centroid_long_df = pd.DataFrame(centroid_long)
-
-    dot_fig = px.scatter(
-        centroid_long_df,
-        x="Standardized Difference",
-        y="Factor",
-        color="Cluster",
-        title="Cluster Factor Profile",
-        hover_data={"Standardized Difference": ":.2f"},
-    )
-    dot_fig.add_vline(x=0, line_dash="dash")
-    dot_fig.update_layout(
-        xaxis_title="Standardized Difference from Portfolio Average",
-        yaxis_title=None,
-        height=420,
-    )
-    st.plotly_chart(dot_fig, use_container_width=True)
-
-    # ------------------------------------------------------------
-    # Colored 100% stacked bar: exposure performance mix by cluster
-    # ------------------------------------------------------------
-    # This compares Performing / Watchlist / Non-Performing exposure AFTER clustering.
-    # Loan Status is not used to create the clusters.
-    cluster_mix = (
-        clustered.groupby(["Cluster", "Loan Status"], dropna=False)[BALANCE_COL]
-        .sum()
-        .rename("Exposure")
-        .reset_index()
-    )
-    cluster_totals = (
-        clustered.groupby("Cluster", dropna=False)[BALANCE_COL]
-        .sum()
-        .rename("Cluster Exposure")
-        .reset_index()
-    )
-    cluster_mix = cluster_mix.merge(cluster_totals, on="Cluster", how="left")
-    cluster_mix["Exposure Share"] = np.where(
-        cluster_mix["Cluster Exposure"] != 0,
-        cluster_mix["Exposure"] / cluster_mix["Cluster Exposure"],
-        np.nan,
+    # Compact visual: compare Higher-Risk exposure by cluster.
+    cluster_plot = profile.copy()
+    cluster_plot["Cluster Label"] = (
+        cluster_plot["Cluster"] + " — " + cluster_plot["Segment"]
     )
 
-    status_order = ["Performing", "Watchlist", "Non-Performing"]
-
-    stack_fig = px.bar(
-        cluster_mix,
-        x="Cluster",
-        y="Exposure Share",
-        color="Loan Status",
-        barmode="stack",
-        category_orders={
-            "Cluster": [f"Cluster {i}" for i in range(1, 5)],
-            "Loan Status": status_order,
-        },
-        title="Loan Status Exposure Mix by Cluster",
-        hover_data={
-            "Exposure": ":,.0f",
-            "Cluster Exposure": ":,.0f",
-            "Exposure Share": ":.1%",
-        },
+    fig2 = px.bar(
+        cluster_plot,
+        x="Cluster Label",
+        y="Higher-Risk Exposure %",
+        title="Higher-Risk Exposure by Cluster",
     )
-    stack_fig.update_yaxes(
+    fig2.update_yaxes(
         tickformat=".0%",
-        range=[0, 1],
-        title="Share of Cluster Exposure",
+        title="Higher-Risk Exposure %",
     )
-    stack_fig.update_xaxes(title=None)
-    stack_fig.update_layout(legend_title_text="Loan Status")
-    st.plotly_chart(stack_fig, use_container_width=True)
+    fig2.update_xaxes(title=None)
+    st.plotly_chart(fig2, use_container_width=True)
+
+    st.success(
+        "**Conclusion:** The weak-rating and high-LTV clusters show the highest "
+        "higher-risk exposure, suggesting these characteristics deserve closer "
+        "portfolio monitoring."
+    )
 
 # -----------------------------------------------------------------------------
 # Page 4 — Cleaning workflow

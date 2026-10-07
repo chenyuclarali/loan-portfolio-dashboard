@@ -1,4 +1,4 @@
-# Loan Portfolio Dashboard v6
+# Loan Portfolio Dashboard v5
 
 Pages:
 1. Data Cleaning
@@ -6,24 +6,20 @@ Pages:
 3. Performance Analysis
 4. Workflow
 
-## Performance Analysis
+Performance Analysis has only two panels:
 
-### Panel 1 — Logistic Regression
-- User-selectable factor bar (multiselect)
-- Numeric predictors standardized
-- Categorical predictors dummy-coded
-- Odds-ratio dot plot with 95% confidence intervals
-- Compact OR / CI / p-value table
-- No dashboard-written conclusion
+## Panel 1 — Logistic Regression
+- Outcome: Higher Risk = Watchlist or Non-Performing
+- Predictors: Risk Rating, LTV, Tenor, Floating vs Fixed
+- Displays one Odds Ratio chart with 95% confidence intervals
+- Ends with one concise conclusion
 
-### Panel 2 — Clustering
-- Fixed 4-cluster K-means
-- Features: Risk Rating, LTV, Tenor, Log Exposure
-- Table shows each cluster's key contributing factor
-- Key factor = centroid dimension with largest absolute standardized deviation
-- Cluster factor dot plot
-- 100% colored stacked bar for Performing / Watchlist / Non-Performing exposure mix
-- No dashboard-written conclusion
+## Panel 2 — Clustering
+- K-means with Risk Rating, LTV, Tenor, and Log Exposure
+- Uses four clusters for interpretability
+- Displays one compact cluster summary table
+- Displays one Higher-Risk Exposure by Cluster chart
+- Ends with one concise conclusion
 
 Run:
 ```powershell
