@@ -1,4 +1,4 @@
-Loan Portfolio Cleaning & Credit Review Dashboard
+Loan Portfolio Cleaning & Review Dashboard
 =================================================
 
 Dashboard Instructions
