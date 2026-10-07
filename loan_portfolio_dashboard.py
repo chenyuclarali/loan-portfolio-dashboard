@@ -2032,23 +2032,64 @@ def render_statistical_analysis_page() -> None:
         use_container_width=True,
     )
 
-    # Compact visual: compare Higher-Risk exposure by cluster.
-    cluster_plot = profile.copy()
-    cluster_plot["Cluster Label"] = (
-        cluster_plot["Cluster"] + " — " + cluster_plot["Segment"]
+    # Performance-colored 100% stacked bar:
+    # show the exposure mix of Performing / Watchlist / Non-Performing within each cluster.
+    cluster_mix = (
+        clustered.groupby(["Cluster", "Loan Status"], dropna=False)[BALANCE_COL]
+        .sum()
+        .rename("Exposure")
+        .reset_index()
     )
 
+    cluster_totals = (
+        clustered.groupby("Cluster", dropna=False)[BALANCE_COL]
+        .sum()
+        .rename("Cluster Exposure")
+        .reset_index()
+    )
+
+    cluster_mix = cluster_mix.merge(cluster_totals, on="Cluster", how="left")
+    cluster_mix["Exposure Share"] = np.where(
+        cluster_mix["Cluster Exposure"] != 0,
+        cluster_mix["Exposure"] / cluster_mix["Cluster Exposure"],
+        np.nan,
+    )
+
+    # Add the descriptive segment name already assigned in the cluster profile.
+    cluster_label_map = (
+        profile.assign(
+            **{
+                "Cluster Label": profile["Cluster"] + " — " + profile["Segment"]
+            }
+        )
+        .set_index("Cluster")["Cluster Label"]
+        .to_dict()
+    )
+    cluster_mix["Cluster Label"] = cluster_mix["Cluster"].map(cluster_label_map)
+
     fig2 = px.bar(
-        cluster_plot,
+        cluster_mix,
         x="Cluster Label",
-        y="Higher-Risk Exposure %",
-        title="Higher-Risk Exposure by Cluster",
+        y="Exposure Share",
+        color="Loan Status",
+        barmode="stack",
+        category_orders={
+            "Loan Status": ["Performing", "Watchlist", "Non-Performing"],
+        },
+        title="Loan Status Exposure Mix by Cluster",
+        hover_data={
+            "Exposure": ":,.0f",
+            "Cluster Exposure": ":,.0f",
+            "Exposure Share": ":.1%",
+        },
     )
     fig2.update_yaxes(
         tickformat=".0%",
-        title="Higher-Risk Exposure %",
+        range=[0, 1],
+        title="Share of Cluster Exposure",
     )
     fig2.update_xaxes(title=None)
+    fig2.update_layout(legend_title_text="Loan Status")
     st.plotly_chart(fig2, use_container_width=True)
 
     st.success(
