@@ -167,11 +167,19 @@ def build_download_workbook(
     original_df: pd.DataFrame | None = None,
 ) -> bytes:
     """
-    Build a downloadable Excel workbook entirely in memory.
+    Build one self-contained Full Results Excel workbook.
 
-    The export preserves the original source extract alongside the current cleaned
-    dataset, validation log, review/exclusion subsets, original cleaning log, and
-    manual-edit audit trail. This makes the workbook self-contained for audit/review.
+    The workbook includes:
+      1. Current data-cleaning / review state and audit logs.
+      2. Full Portfolio Summary tables for Include in Analysis = TRUE records.
+      3. Full Performance Analysis outputs:
+         - core logistic regression
+         - 4-cluster profile
+         - cluster performance mix
+         - loan-level cluster assignments
+
+    All analytical sheets are regenerated from the CURRENT dashboard state at download
+    time, so reviewer edits and Include in Analysis choices are reflected immediately.
     """
     output = io.BytesIO()
 
@@ -182,9 +190,9 @@ def build_download_workbook(
         cols = [c for c in export_df.columns if c != RECORD_ID_COL] + [RECORD_ID_COL]
         export_df = export_df[cols]
 
-    # Keep both unresolved review items and manually excluded records easy to audit.
-    # A reviewed-but-excluded duplicate may no longer require manual review, yet it is
-    # still analytically important to retain in the workbook.
+    # ------------------------------------------------------------------
+    # Data Cleaning / review tables
+    # ------------------------------------------------------------------
     manual_review = export_df[
         export_df["Manual Review Required"].fillna(False).astype(bool)
         | ~export_df["Include in Analysis"].fillna(False).astype(bool)
@@ -197,31 +205,296 @@ def build_download_workbook(
         ~export_df["Include in Analysis"].fillna(False).astype(bool)
     ].copy()
 
+    # ------------------------------------------------------------------
+    # Portfolio Summary tables
+    # ------------------------------------------------------------------
+    portfolio_tables: dict[str, pd.DataFrame] = {}
+
+    if not analysis_included.empty:
+        total_exposure = analysis_included[BALANCE_COL].sum()
+        excluded_exposure = analysis_excluded[BALANCE_COL].sum()
+
+        floating_exposure = analysis_included.loc[
+            analysis_included["Interest Rate Type"]
+            .astype("string")
+            .str.lower()
+            .eq("floating"),
+            BALANCE_COL,
+        ].sum()
+
+        performing_exposure = analysis_included.loc[
+            analysis_included["Loan Status"].astype("string").eq("Performing"),
+            BALANCE_COL,
+        ].sum()
+
+        top_borrowers = top_borrower_summary(analysis_included, top_n=10)
+        largest_borrower_share = (
+            top_borrowers.iloc[0]["Exposure %"]
+            if not top_borrowers.empty
+            else np.nan
+        )
+        top5_share = (
+            top_borrowers["Exposure %"].head(5).sum()
+            if not top_borrowers.empty
+            else np.nan
+        )
+
+        portfolio_tables["Portfolio_Overview"] = pd.DataFrame(
+            [
+                {"Metric": "Included Loans", "Value": len(analysis_included)},
+                {"Metric": "Excluded Loans", "Value": len(analysis_excluded)},
+                {"Metric": "Included Exposure", "Value": total_exposure},
+                {"Metric": "Excluded Exposure", "Value": excluded_exposure},
+                {
+                    "Metric": "Floating Exposure %",
+                    "Value": (
+                        floating_exposure / total_exposure
+                        if total_exposure
+                        else np.nan
+                    ),
+                },
+                {
+                    "Metric": "Performing Exposure %",
+                    "Value": (
+                        performing_exposure / total_exposure
+                        if total_exposure
+                        else np.nan
+                    ),
+                },
+                {
+                    "Metric": "Largest Borrower Exposure %",
+                    "Value": largest_borrower_share,
+                },
+                {"Metric": "Top 5 Borrower Exposure %", "Value": top5_share},
+            ]
+        )
+
+        portfolio_tables["Portfolio_Geography"] = exposure_summary(
+            analysis_included, "Region"
+        )
+        portfolio_tables["Portfolio_Industry"] = exposure_summary(
+            analysis_included, "Industry"
+        )
+        portfolio_tables["Portfolio_BorrowerType"] = exposure_summary(
+            analysis_included, "Borrower Type"
+        )
+        portfolio_tables["Portfolio_FacilityType"] = exposure_summary(
+            analysis_included, "Facility Type"
+        )
+        portfolio_tables["Portfolio_RateMix"] = exposure_summary(
+            analysis_included, "Interest Rate Type"
+        )
+        portfolio_tables["Portfolio_RiskRating"] = risk_rating_summary(
+            analysis_included
+        )
+        portfolio_tables["Portfolio_LoanStatus"] = exposure_summary(
+            analysis_included, "Loan Status"
+        )
+        portfolio_tables["Portfolio_TopBorrowers"] = top_borrowers
+        portfolio_tables["Portfolio_Concentrations"] = concentration_snapshot(
+            analysis_included
+        )
+        portfolio_tables["Portfolio_Assumptions"] = assumptions_table(export_df)
+
+    # ------------------------------------------------------------------
+    # Performance Analysis tables
+    # ------------------------------------------------------------------
+    performance_tables: dict[str, pd.DataFrame] = {}
+
+    if not analysis_included.empty:
+        model_df = prepare_statistical_dataset(analysis_included)
+
+        if not model_df.empty and model_df["Higher Risk"].nunique() >= 2:
+            # Panel 1: core logistic regression.
+            core_table, core_diag = run_core_logistic_inference(model_df)
+            performance_tables["Perf_Logistic"] = core_table.copy()
+
+            performance_tables["Perf_Logistic_Diagnostics"] = pd.DataFrame(
+                [
+                    {"Metric": "Model N", "Value": core_diag.get("n")},
+                    {"Metric": "Higher-Risk Events", "Value": core_diag.get("events")},
+                    {"Metric": "Performing Events", "Value": core_diag.get("non_events")},
+                    {"Metric": "Converged", "Value": core_diag.get("converged")},
+                    {"Metric": "Pseudo R2", "Value": core_diag.get("pseudo_r2")},
+                    {"Metric": "Model LLR p-value", "Value": core_diag.get("llr_pvalue")},
+                    {"Metric": "Model Error", "Value": core_diag.get("error")},
+                ]
+            )
+
+            # Panel 2: fixed 4-cluster solution, matching the dashboard.
+            if len(model_df) >= 8:
+                cluster_features = [
+                    "Risk Rating",
+                    "LTV",
+                    "Tenor",
+                    "Log Exposure",
+                ]
+                _, scaled, _, _ = prepare_cluster_matrix(
+                    model_df,
+                    cluster_features,
+                )
+
+                kmeans = KMeans(
+                    n_clusters=4,
+                    random_state=42,
+                    n_init=20,
+                )
+                labels = kmeans.fit_predict(scaled)
+
+                clustered = model_df.copy()
+                clustered["Cluster"] = pd.Series(
+                    labels,
+                    index=clustered.index,
+                ).map(lambda x: f"Cluster {int(x) + 1}")
+
+                profile = cluster_profile_table(clustered).copy()
+                profile["Segment"] = ""
+
+                weakest_cluster = profile["Avg Risk Rating"].idxmax()
+                highest_ltv_cluster = profile["Median LTV"].idxmax()
+                largest_cluster = profile["Exposure %"].idxmax()
+
+                for idx in profile.index:
+                    if idx == weakest_cluster:
+                        profile.at[idx, "Segment"] = "Weak Rating"
+                    elif idx == highest_ltv_cluster:
+                        profile.at[idx, "Segment"] = "High LTV"
+                    elif idx == largest_cluster:
+                        profile.at[idx, "Segment"] = "Core Portfolio"
+                    else:
+                        profile.at[
+                            idx, "Segment"
+                        ] = "Lower-Risk / Smaller Exposure"
+
+                performance_tables["Perf_Cluster_Profile"] = profile
+
+                # Exposure-weighted status mix underlying the stacked dashboard bar.
+                cluster_mix = (
+                    clustered.groupby(
+                        ["Cluster", "Loan Status"],
+                        dropna=False,
+                    )[BALANCE_COL]
+                    .sum()
+                    .rename("Exposure")
+                    .reset_index()
+                )
+                cluster_totals = (
+                    clustered.groupby("Cluster", dropna=False)[BALANCE_COL]
+                    .sum()
+                    .rename("Cluster Exposure")
+                    .reset_index()
+                )
+                cluster_mix = cluster_mix.merge(
+                    cluster_totals,
+                    on="Cluster",
+                    how="left",
+                )
+                cluster_mix["Exposure Share"] = np.where(
+                    cluster_mix["Cluster Exposure"] != 0,
+                    cluster_mix["Exposure"] / cluster_mix["Cluster Exposure"],
+                    np.nan,
+                )
+                performance_tables["Perf_Cluster_StatusMix"] = cluster_mix
+
+                assignment_cols = [
+                    c
+                    for c in [
+                        RECORD_ID_COL,
+                        "Loan ID",
+                        "Borrower Name",
+                        "Loan Status",
+                        "Higher Risk",
+                        "Cluster",
+                        "Risk Rating",
+                        "LTV",
+                        "Tenor",
+                        BALANCE_COL,
+                        "Interest Rate Type",
+                        "Region",
+                        "Industry",
+                        "Borrower Type",
+                        "Facility Type",
+                        "Relationship Manager",
+                    ]
+                    if c in clustered.columns
+                ]
+                performance_tables["Perf_Cluster_Assignments"] = clustered[
+                    assignment_cols
+                ].copy()
+
+    # ------------------------------------------------------------------
+    # Write all results into one workbook
+    # ------------------------------------------------------------------
     with pd.ExcelWriter(
         output,
         engine="openpyxl",
         date_format="yyyy-mm-dd",
         datetime_format="yyyy-mm-dd",
     ) as writer:
+        # Data Cleaning / audit
         if original_df is not None:
             original_df.to_excel(writer, sheet_name="Original_Data", index=False)
 
         export_df.to_excel(writer, sheet_name="Cleaned_Data", index=False)
-        current_log.to_excel(writer, sheet_name="Current_Validation_Log", index=False)
+        current_log.to_excel(
+            writer,
+            sheet_name="Current_Validation_Log",
+            index=False,
+        )
         manual_review.to_excel(writer, sheet_name="Manual_Review", index=False)
-        analysis_included.to_excel(writer, sheet_name="Analysis_Included", index=False)
-        analysis_excluded.to_excel(writer, sheet_name="Analysis_Excluded", index=False)
+        analysis_included.to_excel(
+            writer,
+            sheet_name="Analysis_Included",
+            index=False,
+        )
+        analysis_excluded.to_excel(
+            writer,
+            sheet_name="Analysis_Excluded",
+            index=False,
+        )
 
         if initial_log is not None and not initial_log.empty:
-            initial_log.to_excel(writer, sheet_name="Initial_Cleaning_Log", index=False)
+            initial_log.to_excel(
+                writer,
+                sheet_name="Initial_Cleaning_Log",
+                index=False,
+            )
 
         if manual_edit_log is not None and not manual_edit_log.empty:
-            manual_edit_log.to_excel(writer, sheet_name="Manual_Edit_Log", index=False)
+            manual_edit_log.to_excel(
+                writer,
+                sheet_name="Manual_Edit_Log",
+                index=False,
+            )
+
+        # Portfolio Summary
+        for sheet_name, table in portfolio_tables.items():
+            table.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # Performance Analysis
+        for sheet_name, table in performance_tables.items():
+            table.to_excel(writer, sheet_name=sheet_name, index=False)
 
         for sheet_name in writer.book.sheetnames:
             format_excel_sheet(writer, sheet_name)
 
     return output.getvalue()
+
+
+def current_full_results_workbook() -> bytes:
+    """
+    Build the Full Results workbook from the current Streamlit session state.
+
+    This helper is shared by Data Cleaning, Portfolio Summary, and Performance Analysis
+    so all three download buttons return the same current workbook.
+    """
+    return build_download_workbook(
+        st.session_state.cleaned_df,
+        st.session_state.current_log,
+        st.session_state.initial_log,
+        st.session_state.manual_edit_log,
+        st.session_state.raw_df,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -249,7 +522,7 @@ def run_initial_cleaning(raw_df: pd.DataFrame) -> None:
             "Manual Review Required"
         ].fillna(False).astype(bool)
 
-    cleaned_df["Reviewer Decision"] = "Pending"
+    cleaned_df["Reviewer Decision"] = ""
     cleaned_df["Reviewer Note"] = ""
 
     st.session_state.raw_df = raw_df.copy()
@@ -335,7 +608,7 @@ def apply_manual_review_edits(edited_review_df: pd.DataFrame) -> None:
         if record_id not in current_by_id.index:
             continue
 
-        decision = str(revised_row.get("Reviewer Decision", "Pending") or "Pending")
+        decision = str(revised_row.get("Reviewer Decision", "") or "")
         note = str(revised_row.get("Reviewer Note", "") or "")
         include_in_analysis = bool(revised_row.get("Include in Analysis", False))
         decision_map[int(record_id)] = (decision, note, include_in_analysis)
@@ -412,7 +685,7 @@ def apply_manual_review_edits(edited_review_df: pd.DataFrame) -> None:
 
     # Restore / normalize review decisions after revalidation.
     if "Reviewer Decision" not in revalidated_df.columns:
-        revalidated_df["Reviewer Decision"] = "Pending"
+        revalidated_df["Reviewer Decision"] = ""
     if "Reviewer Note" not in revalidated_df.columns:
         revalidated_df["Reviewer Note"] = ""
 
@@ -1523,18 +1796,13 @@ def render_cleaning_page() -> None:
     k4.metric("Rows requiring manual review", f"{int(unresolved.sum()):,}")
     k5.metric("Rows included in analysis", f"{int(included.sum()):,}")
 
-    download_bytes = build_download_workbook(
-        cleaned_df,
-        current_log,
-        st.session_state.initial_log,
-        st.session_state.manual_edit_log,
-        st.session_state.raw_df,
-    )
+    download_bytes = current_full_results_workbook()
     st.download_button(
-        "Download current cleaned Excel",
+        "Download Full Results Excel",
         data=download_bytes,
-        file_name="Loan_Portfolio_Cleaned_Dashboard.xlsx",
+        file_name="Loan_Portfolio_Full_Results.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_full_results_cleaning",
     )
 
     # Keep the untouched source extract visible next to the cleaned data. This is useful
@@ -1650,13 +1918,13 @@ def render_cleaning_page() -> None:
                     "Reviewer Decision": st.column_config.SelectboxColumn(
                         "Reviewer Decision",
                         options=[
-                            "Pending",
+                            "",
                             "Pending verification - exclude",
                             "Corrected - recheck",
                             "Verified - keep as-is",
                             "Confirmed duplicate - exclude",
                         ],
-                        required=True,
+                        required=False,
                     ),
                     "Reviewer Note": st.column_config.TextColumn(
                         "Reviewer Note",
@@ -1728,6 +1996,14 @@ def render_summary_page() -> None:
         f"Summary population: {len(df):,} included row(s); "
         f"{len(excluded_df):,} excluded row(s). "
         f"Excluded exposure: {format_currency(excluded_exposure)}."
+    )
+
+    st.download_button(
+        "Download Full Results Excel",
+        data=current_full_results_workbook(),
+        file_name="Loan_Portfolio_Full_Results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_full_results_summary",
     )
 
     total_exposure = df[BALANCE_COL].sum()
@@ -1893,6 +2169,14 @@ def render_statistical_analysis_page() -> None:
     st.info(
         "**Outcome definition:** Higher Risk = Watchlist or Non-Performing; Performing = 0. "
         "Results are exploratory associations, not causal estimates."
+    )
+
+    st.download_button(
+        "Download Full Results Excel",
+        data=current_full_results_workbook(),
+        file_name="Loan_Portfolio_Full_Results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_full_results_performance",
     )
 
     # =====================================================================
@@ -2317,8 +2601,8 @@ def render_workflow_page() -> None:
                 "Stage": "Final output",
                 "Examples": "Cleaned dataset, included/excluded analysis sets, validation log",
                 "Treatment": (
-                    "Portfolio Summary uses only Include in Analysis = TRUE; downloadable Excel "
-                    "preserves included, excluded, review, and audit records."
+                    "Portfolio Summary uses only Include in Analysis = TRUE; the Full Results Excel "
+                    "also includes portfolio-summary and performance-analysis outputs."
                 ),
             },
         ]
