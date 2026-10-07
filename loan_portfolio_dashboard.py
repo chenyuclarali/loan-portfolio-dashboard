@@ -2114,17 +2114,17 @@ def render_workflow_page() -> None:
         rankdir=TB;
         graph [
             bgcolor="transparent",
-            pad="0.10",
-            nodesep="0.18",
-            ranksep="0.28",
+            pad="0.05",
+            nodesep="0.10",
+            ranksep="0.18",
             splines=ortho
         ];
         node [
             shape=box,
             style="rounded,filled",
             fontname="Arial",
-            fontsize=9,
-            margin="0.10,0.06",
+            fontsize=7,
+            margin="0.07,0.04",
             color="#7A7A7A",
             fillcolor="#F7F7F7"
         ];
@@ -2132,7 +2132,7 @@ def render_workflow_page() -> None:
             fontname="Arial",
             fontsize=8,
             color="#6B7280",
-            arrowsize=0.60
+            arrowsize=0.50
         ];
 
         upload [
@@ -2184,7 +2184,7 @@ def render_workflow_page() -> None:
         ];
 
         ltv [
-            label="7. Validate LTV\nNegative → missing + flag\n>100% retained + review flag",
+            label="7. Validate LTV\nNegative retained + review flag\n>100% retained + review flag",
             fillcolor="#FFF4E5",
             color="#D98C20"
         ];
@@ -2285,7 +2285,10 @@ def render_workflow_page() -> None:
     }
     """
 
-    st.graphviz_chart(workflow_dot, use_container_width=True)
+    # Keep the workflow visually compact on wide screens.
+    _, workflow_col, _ = st.columns([0.15, 0.70, 0.15])
+    with workflow_col:
+        st.graphviz_chart(workflow_dot, use_container_width=True)
 
     st.markdown("### Workflow logic")
     logic_df = pd.DataFrame(
@@ -2324,13 +2327,6 @@ def render_workflow_page() -> None:
         ]
     )
     st.dataframe(logic_df, hide_index=True, use_container_width=True)
-
-    st.markdown("### Key control principle")
-    st.info(
-        "**Correct what is deterministic; flag what is uncertain.** "
-        "The workflow avoids silently changing credit/investment data when the correct value "
-        "cannot be supported by the source extract."
-    )
 
     if st.session_state.cleaned_df is not None:
         df = st.session_state.cleaned_df
