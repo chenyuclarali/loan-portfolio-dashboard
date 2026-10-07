@@ -1,6 +1,15 @@
 Loan Portfolio Cleaning & Credit Review Dashboard
 =================================================
 
+Dashboard Instructions
+------------------
+https://loan-portfolio-dashboard.streamlit.app/
+  1. Upload the cleaned portfolio Excel file.
+  2. Review flagged records in Manual Review and update Include in Analysis as needed.
+  3. Use Portfolio Summary and Performance Analysis to review results.
+  4. Click Download Full Results Excel to export the current analysis.
+  5. Results update based on the current Include in Analysis selections.
+
 Sidebar navigation
 ------------------
 Case Study
