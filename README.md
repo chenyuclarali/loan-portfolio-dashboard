@@ -60,5 +60,12 @@ Notes
 - Open manual-review rows are included in the base-case summary by default.
 - A toggle provides a sensitivity view excluding open review rows.
 
-<img width="1102" height="1714" alt="image" src="https://github.com/user-attachments/assets/7cdf4b22-b50f-40d6-9500-b7a755168e0a" />
+<img width="1460" height="943" alt="image" src="https://github.com/user-attachments/assets/605159e2-3398-4045-a667-fab84c0f0024" />
+<img width="1462" height="945" alt="image" src="https://github.com/user-attachments/assets/01d7ebdb-8956-44b1-9949-8b6169d08f99" />
+<img width="1462" height="867" alt="image" src="https://github.com/user-attachments/assets/718a7db6-e8b8-4956-9a5c-1db139c9923f" />
+<img width="1458" height="880" alt="image" src="https://github.com/user-attachments/assets/ff0795ce-a726-45c8-a38f-8559f111c57c" />
+<img width="1457" height="765" alt="image" src="https://github.com/user-attachments/assets/bbb5abcc-dc58-4f77-a1a1-c496f92d21da" />
+<img width="1461" height="883" alt="image" src="https://github.com/user-attachments/assets/328906e1-122b-4d39-8485-3736b9734d31" />
+
+
 
